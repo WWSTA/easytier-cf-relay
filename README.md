@@ -25,6 +25,8 @@
   全部支持**单个与批量操作**（踢出/删除分组/删除路由/删除互联/断开连接/删除摘要注册）
 - **免费额度内稳定运行**：Hibernation + alarm 驱动，典型小网络日请求量约为限额的 5%
 
+<img width="1440" height="731" alt="37eb89828e66b9ccea4709c0f39c7517" src="https://github.com/user-attachments/assets/c02f0765-ff69-4561-a81e-30f294023e8c" />
+
 ## 快速开始
 
 ```bash
