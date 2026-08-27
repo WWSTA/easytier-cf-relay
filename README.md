@@ -8,7 +8,7 @@
 
 由于作者不太会Workers的开发，所以使用了国模**GLM5.3**进行全栈开发。虽然与国模经历来回扯皮，但是仍然有一些不影响使用的特性，下个版本再修，欢迎fork修理。~~（其实是没token了。。。总花费 61 RMB）~~
 
-这是使用本项目部署好的节点[ouret.ccwu.cc](https://ouret.ccwu.cc)（为了更好使用，已禁中转）
+这是使用本项目部署好的节点[wss://ouret.ccwu.cc](https://ouret.ccwu.cc)（由于免费额度有限，为了更好使用，已禁中转）
 
 ## 功能
 
@@ -60,6 +60,9 @@ docs/   部署手册 / 技术文档
 ```
 
 本地敏感变量放 `.dev.vars`（模板见 `.dev.vars.example`）——不入库、不随 deploy 上传生产。
+
+## 另一种选择
+[【教程】Cloudflare Tunnel 自建 EasyTier 共享节点（无Docker，自定义域名 wss:// 接入，客户端自建虚拟局域网，再也不怕公益服务器掉线）](https://github.com/orgs/EasyTier/discussions/2512)
 
 ## 致谢
 
