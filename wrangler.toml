@@ -1,0 +1,80 @@
+# EasyTier Cloudflare Relay — Durable Object 配置
+# 完整变量说明见《部署手册》
+
+name = "easytier-cf-relay"
+main = "src/index.js"
+compatibility_date = "2026-08-26"
+compatibility_flags = ["nodejs_compat"]
+
+# WebSocket Hibernation 需要的最低兼容日期为 2024-04-03
+
+[vars]
+# WebSocket 路径：接受任意路径的升级请求（与官方服务端行为一致），
+# 客户端 -p 直接使用 wss://<域名> 即可；/health 与 /metrics 保留
+# 服务端虚拟 Peer ID（避免与客户端随机 Peer ID 冲突，可用 env 覆盖）
+SERVER_PEER_ID = "10000001"
+# 服务端在握手响应中宣告的网络名（与客户端网络名不同 => 外部网络中继模式）
+SERVER_NETWORK_NAME = "public_server"
+SERVER_HOSTNAME = "cf-relay"
+SERVER_VERSION_STR = "et-cf-relay/1.0.0"
+# 纯 P2P 模式：1 = 在 feature_flag 中宣告 avoid_relay_data（OSPF 给本节点边赋大代价，
+# 客户端优先直连 P2P，中继仅作兜底）；0 = 不宣告
+AVOID_RELAY_DATA = "1"
+# 是否继续转发 Data/KCP 数据包（P2P 失败时的兜底通道）：1 = 转发；0 = 丢弃（严格纯 P2P）
+RELAY_DATA = "1"
+# 同一房间最大 peer 数
+MAX_PEERS_PER_ROOM = "64"
+# 单条 WS 消息最大字节数（EasyTier MTU 默认 1380，RPC 路由同步会更大）
+MAX_MESSAGE_BYTES = "131072"
+# 未握手连接超时（毫秒）—— 幽灵连接清理
+HANDSHAKE_TIMEOUT_MS = "15000"
+# 空闲超时（毫秒）。必须大于客户端 ping 最大间隔 32s
+PEER_IDLE_TIMEOUT_MS = "75000"
+# 服务端主动 ping 阈值（毫秒）：空闲超过该值发送 Ping 探活
+SERVER_PING_IDLE_MS = "40000"
+# 清扫周期（毫秒），alarm 按此周期唤醒 DO 检查
+SWEEP_INTERVAL_MS = "15000"
+# 摘要策略：1 = 同一网络名出现不同摘要时拒绝（默认，防抢占/防嗅探）；0 = 隔离为不同分组
+STRICT_DIGEST = "1"
+# 幽灵节点老化（对齐官方 clear_expired_peer）：
+# - ROUTE_INFO_UNREACHABLE_MS：条目未刷新且节点不可达超过该时长 → 删除（默认 90000）
+# - ROUTE_INFO_TTL_MS：条目未刷新超过该时长 → 无条件删除（默认 3660000）
+ROUTE_INFO_UNREACHABLE_MS = "90000"
+ROUTE_INFO_TTL_MS = "3660000"
+# 空分组自动删除宽限（毫秒）：分组内在线节点归零后持续该时长仍为空 →
+# 整组删除（含路由条目与摘要注册）；0 = 关闭。默认 60000
+GROUP_AUTO_DELETE_MS = "60000"
+# 日志级别：debug | info | warn | error
+LOG_LEVEL = "info"
+# 可选：JSON 映射 {"网络名":"网络密钥"}，配置后服务端校验客户端摘要（SipHash-1-3）
+# NETWORK_SECRETS = "{\"default\":\"my-secret\"}"
+# 可选：DO 房间分片。默认单一房间 "global"；配置后可按 Header/Query 切分房间
+# ROOM_ID = "global"
+# ROOM_HEADER = "X-Room"
+# ROOM_QUERY = "room"
+
+# ---------------------------------------------------------------------------
+# 监控与管理端（生产环境默认全部禁用 —— 不配置即 404，零攻击面）
+# 启用时务必使用随机长路径 + 强 token（两道防线），参考部署手册「监控与管理端」章节
+# ---------------------------------------------------------------------------
+# 统计端点：自定义安全路径（不配置则 /metrics 完全禁用）
+# METRICS_PATH = "/m-please-change-me"
+# 统计端点 token（与 METRICS_PATH 同时配置才启用；支持 Bearer 头或 ?token= 参数）
+# METRICS_TOKEN = "please-change-me-to-a-long-random-string"
+# Web 管理端路径（需与 ADMIN_TOKEN 同时配置才启用；页面壳公开、数据 API 鉴权）
+# ADMIN_PATH = "/admin-please-change-me"
+# 管理端 token（状态查看 / 踢出节点 / 删除分组）
+# ADMIN_TOKEN = "please-change-me-to-another-long-random-string"
+
+[durable_objects]
+bindings = [
+  { name = "RELAY_ROOM", class_name = "RelayRoom" }
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RelayRoom"]
+
+# 说明：
+# - 使用 new_sqlite_classes（存储后端为 SQLite，免费额度内即支持 Hibernation API）
+# - 若已有旧部署（new_classes），不要重复添加迁移，参考部署手册"迁移"章节

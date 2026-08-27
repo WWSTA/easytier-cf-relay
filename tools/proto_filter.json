@@ -1,0 +1,20 @@
+{
+  "messageNames": [
+    "peer_rpc.HandshakeRequest",
+    "peer_rpc.SyncRouteInfoRequest",
+    "peer_rpc.SyncRouteInfoResponse",
+    "peer_rpc.RoutePeerInfo",
+    "peer_rpc.RouteConnBitmap",
+    "peer_rpc.RouteForeignNetworkInfos",
+    "peer_rpc.ReportPeersRequest",
+    "peer_rpc.ReportPeersResponse",
+    "peer_rpc.GetGlobalPeerMapRequest",
+    "peer_rpc.GetGlobalPeerMapResponse",
+    "peer_rpc.PeerInfoForGlobalMap",
+    "peer_rpc.DirectConnectedPeerInfo",
+    "common.RpcPacket",
+    "common.RpcRequest",
+    "common.RpcResponse",
+    "google.protobuf.Timestamp"
+  ]
+}
