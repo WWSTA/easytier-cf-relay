@@ -72,6 +72,19 @@ export class PeerManager {
     this.serverIdentity = null;
     this._lastSessionClean = 0;
     this._lastPeerCenterClean = 0;
+    /**
+     * 可选事件回调（room 层挂接，用于 KV 审计记录；纯逻辑层不依赖审计）：
+     * onEvent({kind, ...}) kind ∈ route-add|route-remove|group-remove|
+     *   pc-report|pc-remove
+     */
+    this.onEvent = null;
+  }
+
+  /** 发射事件（无回调时为无操作，保持纯逻辑可测性） */
+  _emit(ev) {
+    if (typeof this.onEvent === 'function') {
+      try { this.onEvent(ev); } catch { /* 审计失败不影响协议行为 */ }
+    }
   }
 
   // ---------- 服务端身份 ----------
@@ -166,7 +179,7 @@ export class PeerManager {
     if (!old) this.bumpAllConnVersions(groupKey);
     // 幽灵防线：节点（重）连时清掉其名下遗留的路由条目（transit 幽灵 /
     // 持久化残留的过期 direct），由节点随后的自报（direct）重建干净条目。
-    if (g.infos.has(peerId)) this._removeInfoEntry(g, peerId);
+    if (g.infos.has(peerId)) this._removeInfoEntry(g, peerId, 'reconnect');
     return old && old !== ws ? old : null;
   }
 
@@ -177,7 +190,7 @@ export class PeerManager {
     const g = this.groups.get(groupKey);
     if (!g) return false;
     const removed = g.peers.delete(peerId);
-    this._removeInfoEntry(g, peerId);
+    this._removeInfoEntry(g, peerId, 'peer-left');
     g.sessions.delete(peerId);
     if (removed) this.bumpAllConnVersions(groupKey);
     if (g.peers.size === 0 && g.emptySince == null) {
@@ -189,13 +202,14 @@ export class PeerManager {
     return removed;
   }
 
-  /** 删除一条路由条目的全部关联状态 */
-  _removeInfoEntry(g, pid) {
+  /** 删除一条路由条目的全部关联状态。reason 用于审计（peer-left/expire/...） */
+  _removeInfoEntry(g, pid, reason = 'remove') {
     g.infos.delete(pid);
     g.rawInfos.delete(pid);
     g.infoSource.delete(pid);
     g.infoUpdatedAt.delete(pid);
     g.infoReporters.delete(pid);
+    this._emit({ kind: 'route-remove', groupKey: this._keyOfGroup(g), peerId: pid, reason });
   }
 
   /** 从该分组所有 transit 条目的上报者集合中移除 reporterPid，清理失去来源的条目 */
@@ -204,7 +218,7 @@ export class PeerManager {
     for (const [pid, reporters] of g.infoReporters) {
       if (!reporters.delete(reporterPid)) continue;
       if (reporters.size === 0 && !g.peers.has(pid)) {
-        this._removeInfoEntry(g, pid);
+        this._removeInfoEntry(g, pid, 'reporter-gone'); // 唯一来源消失（幽灵防线）
         removed.push(pid);
       }
     }
@@ -288,6 +302,7 @@ export class PeerManager {
         g.infoReporters.set(pid, reporterPid != null ? new Set([reporterPid]) : new Set());
       }
       this.bumpAllConnVersions(groupKey);
+      this._emit({ kind: 'route-add', groupKey, peerId: pid, source });
       return { isNew: true, changed: true, rejected: false };
     }
 
@@ -301,6 +316,7 @@ export class PeerManager {
       g.infoReporters.delete(pid);
       if (rawBytes) g.rawInfos.set(pid, rawBytes);
       else g.rawInfos.delete(pid);
+      this._emit({ kind: 'route-add', groupKey, peerId: pid, source, replaced: 'transit' });
       return { isNew: false, changed: true, rejected: false };
     }
 
@@ -370,7 +386,7 @@ export class PeerManager {
         }
       }
       if (removed.length) {
-        for (const pid of removed) this._removeInfoEntry(g, pid);
+        for (const pid of removed) this._removeInfoEntry(g, pid, 'expire');
         this.bumpAllConnVersions(gk);
         out.push({ groupKey: gk, removed });
       }
@@ -591,18 +607,24 @@ export class PeerManager {
     // autoDeleteEmptyGroups 处理（含摘要注册解除，避免孤儿注册项）
     for (const g of this.groups.values()) {
       for (const [pid, e] of g.peerCenter.globalPeerMap) {
-        if (now - (e.lastSeen || 0) > PEER_CENTER_TTL_MS) g.peerCenter.globalPeerMap.delete(pid);
+        if (now - (e.lastSeen || 0) > PEER_CENTER_TTL_MS) {
+          g.peerCenter.globalPeerMap.delete(pid);
+          this._emit({ kind: 'pc-remove', groupKey: this._keyOfGroup(g), peerId: Number(pid), cause: 'expire' });
+        }
       }
     }
   }
 
   reportPeers(groupKey, myPeerId, peerInfo) {
     const pc = this.getPeerCenter(groupKey);
+    const isNew = !pc.globalPeerMap.has(String(myPeerId));
     pc.globalPeerMap.set(String(myPeerId), {
       directPeers: (peerInfo && peerInfo.directPeers) || {},
       lastSeen: Date.now(),
     });
     pc.digest = '0'; // 失效缓存
+    // 审计：仅记录新增/移除，周期性刷新不记录（避免刷屏）
+    if (isNew) this._emit({ kind: 'pc-report', groupKey, peerId: Number(myPeerId) });
   }
 
   /**
@@ -624,11 +646,12 @@ export class PeerManager {
   // ---------- 管理端：删除操作与状态快照 ----------
 
   /**
-   * 删除整个分组（管理端）。清除路由/会话/PeerCenter 数据；
+   * 删除整个分组（管理端 / 自动清理）。清除路由/会话/PeerCenter 数据；
    * 若摘要注册表条目属于该分组且无同网络其他分组，则一并删除（解除抢占封锁）。
    * 返回被关闭的 peer 列表，由 room 层负责关闭 socket。
+   * @param {string} cause admin | auto | digest-delete（审计用）
    */
-  clearGroup(groupKey) {
+  clearGroup(groupKey, cause = 'admin') {
     const g = this.groups.get(groupKey);
     if (!g) return { existed: false, peerIds: [], networkName: networkNameOfKey(groupKey) };
     const networkName = g.networkName || networkNameOfKey(groupKey);
@@ -646,6 +669,7 @@ export class PeerManager {
       }
       if (!hasSibling) this.digestRegistry.delete(networkName);
     }
+    this._emit({ kind: 'group-remove', groupKey, networkName, cause, routeInfos: g.infos.size });
     return { existed: true, peerIds, networkName };
   }
 
@@ -664,7 +688,7 @@ export class PeerManager {
       if (!Number.isInteger(pid) || pid <= 0) continue;
       if (!g.infos.has(pid)) continue;
       if (g.peers.has(pid)) { skipped.push(pid); continue; }
-      this._removeInfoEntry(g, pid);
+      this._removeInfoEntry(g, pid, 'admin');
       removed.push(pid);
     }
     if (removed.length) this.bumpAllConnVersions(groupKey);
@@ -685,7 +709,7 @@ export class PeerManager {
         continue;
       }
       this.digestRegistry.delete(name);
-      const cleared = this.clearGroup(`${name}:${digest}`);
+      const cleared = this.clearGroup(`${name}:${digest}`, 'digest-delete');
       results.push({
         networkName: name,
         existed: true,
@@ -708,7 +732,10 @@ export class PeerManager {
     for (const raw of peerIds || []) {
       const pid = Number(raw);
       if (!Number.isInteger(pid) || pid <= 0) continue;
-      if (g.peerCenter.globalPeerMap.delete(String(pid))) removed.push(pid);
+      if (g.peerCenter.globalPeerMap.delete(String(pid))) {
+        removed.push(pid);
+        this._emit({ kind: 'pc-remove', groupKey, peerId: pid, cause: 'admin' });
+      }
     }
     g.peerCenter.digest = '0'; // 失效缓存
     return { ok: true, removed };

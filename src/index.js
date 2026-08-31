@@ -14,6 +14,14 @@
  *     POST <ADMIN_PATH>/api/digest/delete    删除摘要注册（批量，需 ADMIN_TOKEN）
  *     POST <ADMIN_PATH>/api/peercenter/delete 删除互联表条目（批量，需 ADMIN_TOKEN）
  *     POST <ADMIN_PATH>/api/socket/close      断开连接（批量，需 ADMIN_TOKEN）
+ *     KV 审计（记录 + 黑名单）：
+ *     GET  <ADMIN_PATH>/api/records          记录查询（?type=&offset=&limit=）
+ *     POST <ADMIN_PATH>/api/records/delete    删除记录（admin 类为硬审计不可删）
+ *     GET  <ADMIN_PATH>/api/record/config     记录配置（每类开关 + 上限）
+ *     POST <ADMIN_PATH>/api/record/config     修改记录配置
+ *     GET  <ADMIN_PATH>/api/blacklist         黑名单查询（?cat=&offset=&limit=）
+ *     POST <ADMIN_PATH>/api/blacklist/add     黑名单手工添加
+ *     POST <ADMIN_PATH>/api/blacklist/delete  黑名单移除（解除封锁）
  *                             （不配置 ADMIN_PATH + ADMIN_TOKEN 则完全禁用）
  * - 任意路径 WebSocket 升级 -> DO（官方客户端用用户配置的 URL，路径不定，
  *   官方服务端同样接受任意路径；保留路径除外）
@@ -153,14 +161,72 @@ async function handleAdmin(request, url, env, adminPath) {
 
   const roomId = resolveRoomId(request, url, env);
   const stub = env.RELAY_ROOM.get(env.RELAY_ROOM.idFromName(roomId));
+  // 管理员来源 IP（DO 内部端点用于审计登录/操作/查看）
+  const adminHeaders = {
+    'content-type': 'application/json',
+    'x-admin-ip': request.headers.get('CF-Connecting-IP') || '',
+  };
 
   if (sub === '/api/state' && request.method === 'GET') {
     // 分页参数透传（tab/offset/limit/groupKey）
     const qs = url.searchParams.toString();
-    return stub.fetch(new Request(`https://do/internal/state${qs ? '?' + qs : ''}`, { method: 'GET' }));
+    return stub.fetch(new Request(`https://do/internal/state${qs ? '?' + qs : ''}`, {
+      method: 'GET',
+      headers: { 'x-admin-ip': adminHeaders['x-admin-ip'] },
+    }));
   }
   if (sub === '/api/metrics' && request.method === 'GET') {
     return stub.fetch(new Request('https://do/internal/stats', { method: 'GET' }));
+  }
+
+  // KV 审计：记录查询 / 记录删除 / 记录配置
+  if (sub === '/api/records' && request.method === 'GET') {
+    const qs = url.searchParams.toString();
+    return stub.fetch(new Request(`https://do/internal/records${qs ? '?' + qs : ''}`, {
+      method: 'GET',
+      headers: { 'x-admin-ip': adminHeaders['x-admin-ip'] },
+    }));
+  }
+  if (sub === '/api/record/config') {
+    if (request.method === 'GET') {
+      return stub.fetch(new Request('https://do/internal/record/config', {
+        method: 'GET',
+        headers: { 'x-admin-ip': adminHeaders['x-admin-ip'] },
+      }));
+    }
+    if (request.method === 'POST') {
+      const body = await request.text();
+      return stub.fetch(new Request('https://do/internal/record/config', {
+        method: 'POST', headers: adminHeaders, body,
+      }));
+    }
+  }
+  if (sub === '/api/records/delete' && request.method === 'POST') {
+    const body = await request.text();
+    return stub.fetch(new Request('https://do/internal/records/delete', {
+      method: 'POST', headers: adminHeaders, body,
+    }));
+  }
+
+  // 黑名单：查询 / 添加 / 移除
+  if (sub === '/api/blacklist' && request.method === 'GET') {
+    const qs = url.searchParams.toString();
+    return stub.fetch(new Request(`https://do/internal/blacklist${qs ? '?' + qs : ''}`, {
+      method: 'GET',
+      headers: { 'x-admin-ip': adminHeaders['x-admin-ip'] },
+    }));
+  }
+  if (sub === '/api/blacklist/add' && request.method === 'POST') {
+    const body = await request.text();
+    return stub.fetch(new Request('https://do/internal/blacklist/add', {
+      method: 'POST', headers: adminHeaders, body,
+    }));
+  }
+  if (sub === '/api/blacklist/delete' && request.method === 'POST') {
+    const body = await request.text();
+    return stub.fetch(new Request('https://do/internal/blacklist/delete', {
+      method: 'POST', headers: adminHeaders, body,
+    }));
   }
 
   const postRoutes = {
@@ -176,7 +242,7 @@ async function handleAdmin(request, url, env, adminPath) {
     const body = await request.text();
     return stub.fetch(new Request(`https://do${internalPath}`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: adminHeaders,
       body,
     }));
   }

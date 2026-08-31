@@ -97,6 +97,9 @@ export const ADMIN_HTML = `<!doctype html>
   <button data-tab="peercenter">全局互联 <span class="cnt" id="c-pc">-</span></button>
   <button data-tab="sockets">连接列表 <span class="cnt" id="c-sockets">-</span></button>
   <button data-tab="digests">摘要注册表 <span class="cnt" id="c-digests">-</span></button>
+  <button data-tab="records">记录查询 <span class="cnt" id="c-records">-</span></button>
+  <button data-tab="reccfg">记录设置</button>
+  <button data-tab="blacklist">黑名单 <span class="cnt" id="c-bl">-</span></button>
   <div class="foot">官方 easytier-cli 命令对照见「总览」页底</div>
 </nav>
 <div class="main">
@@ -123,9 +126,27 @@ var TAB = 'overview';
 var OFFSET = 0;
 var LIMIT = 50;
 var GROUP_FILTER = '';
+var REC_TYPE = 'peers';   // 记录查询当前类型
+var BL_CAT = 'peer';       // 黑名单当前类别
 var S = null;          // 当前 tab 响应
 var OVERVIEW = null;   // 最近一次 overview（侧边栏计数）
 var SEL = {};          // 勾选集合：key -> row 数据
+
+var REC_TYPE_NAMES = {
+  groups: '网络分组', peers: '节点在线', routes: '路由信息', peercenter: '全局互联',
+  sockets: '连接列表', digests: '摘要注册表', admin: '管理端审计（硬记录）'
+};
+var BL_CAT_NAMES = { peer: '节点（PeerId）', group: '网络分组（网络名）', digest: '摘要注册（网络名）', socket: '连接（客户端 IP）' };
+var EVENT_LABELS = {
+  join: '加入', leave: '离开', replace: '顶替重连', kick: '踢出', reject: '拒绝',
+  create: '创建', delete: '删除', register: '注册',
+  add: '新增', remove: '移除', open: '打开', close: '关闭', error: '异常',
+  expire: '老化清除', login: '登录', view: '查看', op: '操作'
+};
+var REMOVE_REASONS = {
+  'peer-left': '节点离开', 'reporter-gone': '上报者断开', expire: '老化清除',
+  admin: '管理端删除', reconnect: '重连清理', remove: '移除'
+};
 
 function $(id){ return document.getElementById(id); }
 function esc(s){ var d = document.createElement('div'); d.textContent = s == null ? '' : String(s); return d.innerHTML; }
@@ -149,9 +170,19 @@ function post(path, body) {
 
 /* ---------------- 数据加载 ---------------- */
 function loadTab(keepSel) {
-  var qs = '?tab=' + TAB + '&offset=' + OFFSET + '&limit=' + LIMIT + (GROUP_FILTER ? '&groupKey=' + encodeURIComponent(GROUP_FILTER) : '');
+  var p;
+  if (TAB === 'records') {
+    p = api('/api/records?type=' + REC_TYPE + '&offset=' + OFFSET + '&limit=' + LIMIT);
+  } else if (TAB === 'reccfg') {
+    p = api('/api/record/config');
+  } else if (TAB === 'blacklist') {
+    p = api('/api/blacklist?cat=' + BL_CAT + '&offset=' + OFFSET + '&limit=' + LIMIT);
+  } else {
+    var qs = '?tab=' + TAB + '&offset=' + OFFSET + '&limit=' + LIMIT + (GROUP_FILTER ? '&groupKey=' + encodeURIComponent(GROUP_FILTER) : '');
+    p = api('/api/state' + qs);
+  }
   $('status').textContent = '加载中…';
-  return api('/api/state' + qs).then(function (s) {
+  return p.then(function (s) {
     S = s;
     if (s.tab === 'overview') OVERVIEW = s;
     if (!keepSel) SEL = {}; // 翻页/切页清空勾选；自动刷新保留用户勾选
@@ -177,13 +208,17 @@ function applySideCounters() {
   $('c-routes').textContent = st.routes ? st.routes.total : '-';
   $('c-pc').textContent = st.peerCenter ? st.peerCenter.total : '-';
   $('c-digests').textContent = st.digests ? st.digests.total : '-';
+  $('c-sockets').textContent = st.sockets ? st.sockets.total : '-';
+  $('c-records').textContent = st.audit && st.audit.records ? st.audit.records._total : '-';
+  $('c-bl').textContent = st.audit && st.audit.blacklist ? st.audit.blacklist._total : '-';
 }
 
 /* ---------------- 渲染 ---------------- */
 var TABS = {
   overview: '总览', groups: '网络分组（foreign-network）', peers: '节点在线（peer）',
   routes: '路由信息（route）', peercenter: '全局互联（peer-center）',
-  sockets: '连接列表（含未握手）', digests: '摘要注册表（网络名 → 摘要）'
+  sockets: '连接列表（含未握手）', digests: '摘要注册表（网络名 → 摘要）',
+  records: '记录查询（KV 审计）', reccfg: '记录设置', blacklist: '黑名单（分四类）'
 };
 
 function render(s) {
@@ -194,13 +229,32 @@ function render(s) {
   renderPager(s);
 }
 
-function chip(label, val, cls) { return '<div class="chip ' + (cls || '') + '"><b>' + esc(val) + '</b><span>' + esc(label) + '</span></div>'; }
+function chip(label, val, cls, title) { return '<div class="chip ' + (cls || '') + '"' + (title ? ' title="' + esc(title) + '"' : '') + '><b>' + esc(val) + '</b><span>' + esc(label) + '</span></div>'; }
+
+var UPTIME_TITLE = '自房间（Durable Object）首次创建起累计，含休眠时间；仅 DO 存储重置时重新计时';
 
 function renderChips(s) {
   var st = s && s.stats;
   var h = '';
   if (s && s.counters) {
-    h += chip('运行时长', dur(s.uptimeSec * 1000), 'hl');
+    h += chip('运行时长', dur(s.uptimeSec * 1000), 'hl', UPTIME_TITLE);
+  }
+  // 记录 / 记录设置 / 黑名单（非 state 端点，无 stats 结构）
+  if (TAB === 'records') {
+    h += chip('该类记录', s.total, 'hl');
+    var cnt = (OVERVIEW && OVERVIEW.stats && OVERVIEW.stats.audit && OVERVIEW.stats.audit.records) || null;
+    if (cnt) h += chip('全部记录', cnt._total);
+    var kvOn = OVERVIEW && OVERVIEW.stats && OVERVIEW.stats.audit && OVERVIEW.stats.audit.kvEnabled;
+    h += chip('KV 存储', kvOn ? '启用' : '未启用（仅 DO 存储）', kvOn ? 'good' : '');
+  } else if (TAB === 'reccfg') {
+    h += chip('KV 存储', s.kvEnabled ? '启用' : '未启用（仅 DO 存储）', s.kvEnabled ? 'good' : '');
+    h += chip('KV 刷写间隔', s.flushMs ? dur(s.flushMs) : '-');
+    h += chip('管理端审计', s.adminAudit ? '开（硬设置）' : '关（硬设置）', s.adminAudit ? 'good' : 'bad',
+      '由 wrangler.toml ADMIN_AUDIT 硬设置，管理页不可修改；记录管理员登录（IP/时间）、操作与查看');
+  } else if (TAB === 'blacklist') {
+    var bc = s.counts || {};
+    h += chip('该类条目', s.total, 'hl');
+    h += chip('全部黑名单', bc._total != null ? bc._total : '-');
   }
   if (!st) { $('chips').innerHTML = h; return; }
   if (TAB === 'overview') {
@@ -210,6 +264,12 @@ function renderChips(s) {
     h += chip('幽灵条目', st.routes.ghost, st.routes.ghost ? 'bad' : 'good');
     h += chip('互联条目', st.peerCenter.total);
     h += chip('摘要注册', st.digests.total);
+    if (st.sockets) h += chip('当前连接', st.sockets.total);
+    if (st.audit) {
+      h += chip('审计记录', st.audit.records ? st.audit.records._total : '-');
+      h += chip('黑名单', st.audit.blacklist ? st.audit.blacklist._total : '-',
+        st.audit.blacklist && st.audit.blacklist._total ? 'bad' : 'good');
+    }
   } else if (TAB === 'groups') {
     h += chip('分组总数', st.total, 'hl');
     h += chip('空分组', st.empty, st.empty ? 'bad' : 'good');
@@ -281,12 +341,37 @@ function renderToolbar(s) {
   } else if (TAB === 'digests') {
     h += '<button class="act danger" id="batch" ' + (hasSel ? '' : 'disabled') + '>删除选中注册（' + Object.keys(SEL).length + '）</button>';
     h += '<span class="sep"></span>';
+  } else if (TAB === 'records') {
+    var isAdminType = REC_TYPE === 'admin';
+    h += '<label>记录类型 <select id="rectype">';
+    Object.keys(REC_TYPE_NAMES).forEach(function (t) {
+      h += '<option value="' + t + '"' + (t === REC_TYPE ? ' selected' : '') + '>' + REC_TYPE_NAMES[t] + '</option>';
+    });
+    h += '</select></label>';
+    h += '<button class="act danger" id="batch" ' + (hasSel && !isAdminType ? '' : 'disabled') + (isAdminType ? ' title="管理端审计为硬记录，不可删除"' : '') + '>删除选中记录（' + Object.keys(SEL).length + '）</button>';
+    h += '<button class="act ghost" id="clearall" ' + (isAdminType ? 'disabled' : '') + '>清空该类</button>';
+    h += '<span class="sep"></span>';
+  } else if (TAB === 'blacklist') {
+    h += '<label>类别 <select id="blcat">';
+    Object.keys(BL_CAT_NAMES).forEach(function (c) {
+      h += '<option value="' + c + '"' + (c === BL_CAT ? ' selected' : '') + '>' + BL_CAT_NAMES[c] + '</option>';
+    });
+    h += '</select></label>';
+    h += '<input id="blvalue" placeholder="' + (BL_CAT === 'peer' ? 'PeerId（数字）' : (BL_CAT === 'socket' ? 'IP 地址' : '网络名')) + '" style="background:var(--bg);border:1px solid var(--line);color:var(--fg);border-radius:6px;padding:5px 8px;font-size:12px;width:150px">';
+    h += '<input id="blreason" placeholder="原因（可选）" style="background:var(--bg);border:1px solid var(--line);color:var(--fg);border-radius:6px;padding:5px 8px;font-size:12px;width:130px">';
+    h += '<button class="act" id="bladd">加入黑名单</button>';
+    h += '<button class="act danger" id="batch" ' + (hasSel ? '' : 'disabled') + '>移除选中（解除封锁）（' + Object.keys(SEL).length + '）</button>';
+    h += '<button class="act ghost" id="blclear">清空该类</button>';
+    h += '<span class="sep"></span>';
+  } else if (TAB === 'reccfg') {
+    h += '<button class="act" id="reccfgsave">保存设置</button>';
+    h += '<span class="sep"></span>';
   }
   if (TAB === 'peers' || TAB === 'routes' || TAB === 'peercenter') {
     ensureGroupKeys(s);
     h += '<label>分组过滤 <select id="groupsel">' + groupOptions(GROUP_FILTER) + '</select></label>';
   }
-  if (TAB !== 'overview') {
+  if (TAB !== 'overview' && TAB !== 'reccfg') {
     h += '<label>每页 <select id="pagesize"><option' + (LIMIT === 20 ? ' selected' : '') + '>20</option><option' + (LIMIT === 50 ? ' selected' : '') + '>50</option><option' + (LIMIT === 100 ? ' selected' : '') + '>100</option><option' + (LIMIT === 200 ? ' selected' : '') + '>200</option></select> 条</label>';
   }
   $('toolbar').innerHTML = h;
@@ -296,6 +381,18 @@ function renderToolbar(s) {
   if (gs) gs.onchange = function () { GROUP_FILTER = gs.value; OFFSET = 0; loadTab(); };
   var ps = $('pagesize');
   if (ps) ps.onchange = function () { LIMIT = Number(ps.value); OFFSET = 0; loadTab(); };
+  var rt = $('rectype');
+  if (rt) rt.onchange = function () { REC_TYPE = rt.value; OFFSET = 0; SEL = {}; loadTab(); };
+  var ca = $('clearall');
+  if (ca) ca.onclick = function () { doAction('clear-records', [{}]); };
+  var bc2 = $('blcat');
+  if (bc2) bc2.onchange = function () { BL_CAT = bc2.value; OFFSET = 0; SEL = {}; loadTab(); };
+  var ba = $('bladd');
+  if (ba) ba.onclick = onBlAdd;
+  var bclr = $('blclear');
+  if (bclr) bclr.onclick = function () { doAction('bl-clear', [{}]); };
+  var rs = $('reccfgsave');
+  if (rs) rs.onclick = onRecCfgSave;
 }
 
 /* ---------------- 表格 ---------------- */
@@ -308,6 +405,8 @@ function rowKey(it) {
   if (TAB === 'peercenter') return it.groupKey + ':' + it.myPeerId;
   if (TAB === 'sockets') return 'sock:' + it.socketId;
   if (TAB === 'digests') return it.networkName;
+  if (TAB === 'records') return 'rec:' + it.id;
+  if (TAB === 'blacklist') return 'bl:' + it.id;
   return '';
 }
 function actionBtn(label, act, payload) {
@@ -316,22 +415,28 @@ function actionBtn(label, act, payload) {
 
 function renderTable(s) {
   if (TAB === 'overview') { renderOverview(s); return; }
+  if (TAB === 'reccfg') { renderRecCfg(s); return; }
   var items = s.items || [];
   if (!items.length) {
     $('content').innerHTML = '<div class="empty">暂无数据' + (GROUP_FILTER ? '（当前分组过滤）' : '') + '</div>';
     return;
   }
   var h = '<table><thead><tr>';
-  if (TAB !== 'overview') h += '<th style="width:28px"><input type="checkbox" id="selall" title="全选本页"></th>';
+  if (TAB === 'records') h += '<th style="width:28px"><input type="checkbox" id="selall" title="全选本页"' + (REC_TYPE === 'admin' ? ' disabled' : '') + '></th>';
+  else if (TAB === 'blacklist') h += '<th style="width:28px"><input type="checkbox" id="selall" title="全选本页"></th>';
+  else h += '<th style="width:28px"><input type="checkbox" id="selall" title="全选本页"></th>';
   if (TAB === 'groups') h += '<th>网络名</th><th>在线节点</th><th>路由条目</th><th>互联条目</th><th>空闲时长</th><th>分组 Key</th><th>操作</th>';
   if (TAB === 'peers') h += '<th>分组</th><th>PeerId</th><th>连接时间</th><th>最近活动</th><th>操作</th>';
   if (TAB === 'routes') h += '<th>分组</th><th>PeerId</th><th>主机名</th><th>版本</th><th>EasyTier 版本</th><th>来源</th><th>状态</th><th>最后更新</th><th>操作</th>';
   if (TAB === 'peercenter') h += '<th>分组</th><th>上报方 PeerId</th><th>直连节点</th><th>最近上报</th><th>操作</th>';
-  if (TAB === 'sockets') h += '<th>ID</th><th>PeerId</th><th>分组</th><th>已握手</th><th>连接时间</th><th>最近活动</th><th>操作</th>';
+  if (TAB === 'sockets') h += '<th>ID</th><th>PeerId</th><th>分组</th><th>已握手</th><th>客户端 IP</th><th>连接时间</th><th>最近活动</th><th>操作</th>';
   if (TAB === 'digests') h += '<th>网络名</th><th>摘要</th><th>分组存在</th><th>操作</th>';
+  if (TAB === 'records') h += '<th>时间</th><th>事件</th><th>明细</th>' + (REC_TYPE === 'admin' ? '' : '<th>操作</th>');
+  if (TAB === 'blacklist') h += '<th>值</th><th>加入时间</th><th>原因</th><th>附加</th><th>操作</th>';
   h += '</tr></thead><tbody>';
   items.forEach(function (it) {
     var k = rowKey(it);
+    var noSel = TAB === 'records' && REC_TYPE === 'admin';
     h += '<tr><td class="nosel">' + selBox(k, it) + '</td>';
     if (TAB === 'groups') {
       h += '<td>' + esc(it.networkName) + '</td><td>' + it.peerCount + '</td><td>' + it.routeCount + '</td><td>' + it.peerCenterCount +
@@ -356,11 +461,20 @@ function renderTable(s) {
         '<td>' + actionBtn('删除', 'del-pc', { groupKey: it.groupKey, peerId: it.myPeerId }) + '</td>';
     } else if (TAB === 'sockets') {
       h += '<td><code>#' + esc(it.socketId) + '</code></td><td>' + (it.peerId == null ? '-' : esc(it.peerId)) + '</td><td><code>' + esc(it.groupKey || '-') +
-        '</code></td><td>' + (it.handshaked ? '是' : '否') + '</td><td>' + fmt(it.connectedAt) + '</td><td>' + fmt(it.lastSeen) +
+        '</code></td><td>' + (it.handshaked ? '是' : '否') + '</td><td>' + (it.ip ? esc(it.ip) : '-') + '</td><td>' + fmt(it.connectedAt) + '</td><td>' + fmt(it.lastSeen) +
         '</td><td>' + actionBtn('断开', 'close-sock', { socketId: it.socketId }) + '</td>';
     } else if (TAB === 'digests') {
       h += '<td>' + esc(it.networkName) + '</td><td><code>' + esc(String(it.digest).slice(0, 16)) + '…</code></td><td>' + (it.groupExists ? '是' : '否') +
         '</td><td>' + actionBtn('删除', 'del-digest', { networkName: it.networkName }) + '</td>';
+    } else if (TAB === 'records') {
+      var ev = EVENT_LABELS[it.event] || it.event;
+      if (it.count > 1) ev += ' ×' + it.count;
+      h += '<td>' + new Date(it.ts).toLocaleString() + '</td><td>' + esc(ev) + '</td><td>' + recDetail(it) + '</td>';
+      if (!noSel) h += '<td>' + actionBtn('删除', 'del-record', { id: it.id }) + '</td>';
+    } else if (TAB === 'blacklist') {
+      h += '<td><code>' + esc(it.value) + '</code></td><td>' + new Date(it.ts).toLocaleString() + '</td><td>' + esc(it.reason || '-') + '</td><td>' +
+        esc([it.groupKey, it.networkName, it.socketId != null ? 'socket #' + it.socketId : null].filter(Boolean).join(' · ') || '-') +
+        '</td><td>' + actionBtn('移除', 'bl-remove-one', { id: it.id }) + '</td>';
     }
     h += '</tr>';
   });
@@ -368,6 +482,7 @@ function renderTable(s) {
   $('content').innerHTML = h;
   var sa = $('selall');
   if (sa) sa.onclick = function () {
+    if (sa.disabled) return;
     var checked = sa.checked;
     (s.items || []).forEach(function (it) {
       var k = rowKey(it);
@@ -379,12 +494,84 @@ function renderTable(s) {
   };
 }
 
+/** 记录明细：紧凑 k=v 渲染 */
+function recDetail(it) {
+  var skip = { id: 1, ts: 1, event: 1, count: 1 };
+  var parts = [];
+  Object.keys(it).forEach(function (k) {
+    if (skip[k]) return;
+    var v = it[k];
+    if (v == null || v === '') return;
+    if (k === 'reason' && REMOVE_REASONS[v]) v = REMOVE_REASONS[v];
+    if (k === 'cause' && REMOVE_REASONS[v]) v = REMOVE_REASONS[v];
+    if (k === 'cause' && /^blacklist:/.test(v)) v = '黑名单拦截（' + v.slice(10) + '）';
+    parts.push('<span class="muted">' + esc(k) + '</span> ' + esc(v));
+  });
+  return parts.length ? parts.join('<span class="muted"> · </span>') : '-';
+}
+
+/** 记录设置页 */
+function renderRecCfg(s) {
+  var types = s.types || {};
+  var h = '<div class="card" style="max-width:860px"><h3>各类记录开关与上限</h3>';
+  h += '<div class="muted" style="margin-bottom:10px">每类信息只占一条 KV 键；关闭后该类事件不再记录，已存记录可到「记录查询」清空。</div>';
+  h += '<table><thead><tr><th>记录类型</th><th>当前条数</th><th>启用</th><th>存储上限（条）</th></tr></thead><tbody>';
+  Object.keys(REC_TYPE_NAMES).forEach(function (t) {
+    if (t === 'admin') return;
+    var c = types[t] || {};
+    var n = (s.counts && s.counts[t]) != null ? s.counts[t] : '-';
+    h += '<tr><td>' + REC_TYPE_NAMES[t] + '</td><td>' + n + '</td>' +
+      '<td><input type="checkbox" data-rec-on="' + t + '"' + (c.on !== false ? ' checked' : '') + '></td>' +
+      '<td><input type="number" min="1" max="10000" value="' + esc(c.limit || 100) + '" data-rec-limit="' + t + '" style="background:var(--bg);border:1px solid var(--line);color:var(--fg);border-radius:6px;padding:4px 8px;width:90px"></td></tr>';
+  });
+  h += '</tbody></table>';
+  h += '<div style="margin-top:10px"><span class="tag on">管理端审计</span> ' +
+    (s.adminAudit ? '已启用（硬设置，上限 ' + s.adminAuditLimit + ' 条，记录管理员登录/操作/查看，管理页不可关闭或删除）'
+      : '未启用（wrangler.toml ADMIN_AUDIT=0）') + '</div>';
+  h += '<div class="muted" style="margin-top:8px">黑名单上限（硬设置）：' + esc(s.blacklistLimit) + ' 条/类；KV 刷写间隔：' +
+    (s.flushMs ? dur(s.flushMs) : '-') + '；KV 存储：' + (s.kvEnabled ? '已启用' : '未启用（仅 DO 存储，功能不受影响）') + '</div>';
+  h += '</div>';
+  $('content').innerHTML = h;
+}
+
+function onRecCfgSave() {
+  var types = {};
+  document.querySelectorAll('input[data-rec-on]').forEach(function (cb) {
+    var t = cb.getAttribute('data-rec-on');
+    types[t] = types[t] || {};
+    types[t].on = cb.checked;
+  });
+  document.querySelectorAll('input[data-rec-limit]').forEach(function (inp) {
+    var t = inp.getAttribute('data-rec-limit');
+    types[t] = types[t] || {};
+    var v = Number(inp.value);
+    if (Number.isFinite(v) && v > 0) types[t].limit = Math.floor(v);
+  });
+  post('/api/record/config', { types: types }).then(function (r) {
+    toast(r.ok ? '记录设置已保存' : '保存失败：' + (r.error || '未知错误'), !r.ok);
+    loadTab();
+    refreshSideCounters();
+  }).catch(function (e) { toast('保存失败：' + e.message, true); });
+}
+
+function onBlAdd() {
+  var v = ($('blvalue').value || '').trim();
+  if (!v) { toast('请输入要拉黑的值', true); return; }
+  var reason = ($('blreason').value || '').trim() || 'manual';
+  post('/api/blacklist/add', { cat: BL_CAT, value: v, reason: reason }).then(function (r) {
+    if (!r.ok) { toast('添加失败：' + (r.error || '未知错误'), true); return; }
+    toast(r.existed ? '已在该类黑名单中（时间已刷新）' : '已加入黑名单');
+    loadTab();
+    refreshSideCounters();
+  }).catch(function (e) { toast('添加失败：' + e.message, true); });
+}
+
 function renderOverview(s) {
   var st = s.stats || {};
   var h = '<div class="grid">';
   // 服务端
   h += '<div class="card"><h3>服务端（node / status）</h3>';
-  h += kv('运行时长', dur(s.uptimeSec * 1000));
+  h += kv('运行时长', dur(s.uptimeSec * 1000), null, UPTIME_TITLE);
   h += kv('serverPeerId', s.serverPeerId);
   if (s.config) {
     h += kv('hostname', s.config.serverHostname);
@@ -392,8 +579,11 @@ function renderOverview(s) {
     h += kv('纯 P2P', s.config.avoidRelayData ? '开' : '关');
     h += kv('数据中继', s.config.relayData ? '开' : '关');
     h += kv('密钥校验', s.config.digestValidation ? '开' : '关');
-    h += kv('房间上限', s.config.maxPeersPerRoom);
-    h += kv('幽灵老化', dur(s.config.routeInfoUnreachableMs) + ' / ' + dur(s.config.routeInfoTtlMs));
+    h += kv('单房间节点数上限', s.config.maxPeersPerRoom, null,
+      '同一房间（Durable Object）内允许的最大在线节点数（MAX_PEERS_PER_ROOM）');
+    h += kv('路由条目老化', dur(s.config.routeInfoUnreachableMs) + ' / ' + dur(s.config.routeInfoTtlMs), null,
+      '斜杠前：条目未刷新且节点不可达超过该时长（1m30s = 90 秒）即删除；' +
+      '斜杠后：条目未刷新超过该时长（1h1m = 61 分钟）无条件删除。活跃节点会周期性刷新，不受影响');
     h += kv('空组自动删除', s.config.groupAutoDeleteMs > 0 ? dur(s.config.groupAutoDeleteMs) : '关闭');
   }
   h += '</div>';
@@ -433,6 +623,28 @@ function renderOverview(s) {
     h += kv('注册总数', st.digests.total);
     h += '</div>';
   }
+  if (st.sockets) {
+    h += '<div class="card"><h3>连接列表</h3>';
+    h += kv('当前连接', st.sockets.total);
+    h += kv('已握手', st.sockets.handshaked);
+    h += kv('待握手', st.sockets.pending);
+    h += '</div>';
+  }
+  if (st.audit) {
+    h += '<div class="card"><h3>审计（KV 记录 + 黑名单）</h3>';
+    var rc = st.audit.records || {};
+    h += kv('记录总数', rc._total != null ? rc._total : '-');
+    h += kv('网络分组 / 节点', (rc.groups || 0) + ' / ' + (rc.peers || 0));
+    h += kv('路由 / 互联', (rc.routes || 0) + ' / ' + (rc.peercenter || 0));
+    h += kv('连接 / 摘要 / 管理端', (rc.sockets || 0) + ' / ' + (rc.digests || 0) + ' / ' + (rc.admin || 0));
+    var blc = st.audit.blacklist || {};
+    h += kv('黑名单总数', blc._total != null ? blc._total : '-',
+      blc._total ? 'bad' : 'good');
+    h += kv('黑名单（节点/分组/摘要/IP）',
+      (blc.peer || 0) + ' / ' + (blc.group || 0) + ' / ' + (blc.digest || 0) + ' / ' + (blc.socket || 0));
+    h += kv('KV 存储', st.audit.kvEnabled ? '启用' : '未启用（仅 DO 存储）');
+    h += '</div>';
+  }
   h += '</div>';
   $('content').innerHTML = h;
   $('content2').innerHTML =
@@ -447,11 +659,11 @@ function renderOverview(s) {
     '<tr><td><code>connector / mapped-listener / stun / vpn-portal / proxy / acl / port-forward / whitelist / credential / service</code></td><td>不适用</td><td>依赖 UDP/TUN/系统服务，Cloudflare Workers 运行时不可用</td></tr>' +
     '</table></div>';
 }
-function kv(k, v) { return '<div class="kv"><span>' + esc(k) + '</span><b>' + esc(v) + '</b></div>'; }
+function kv(k, v, cls, title) { return '<div class="kv"' + (title ? ' title="' + esc(title) + '"' : '') + '><span>' + esc(k) + '</span><b class="' + (cls || '') + '" style="' + (cls === 'bad' ? 'color:var(--bad)' : (cls === 'good' ? 'color:var(--ok)' : '')) + '">' + esc(v) + '</b></div>'; }
 
 /* ---------------- 分页 ---------------- */
 function renderPager(s) {
-  if (TAB === 'overview') { $('pager').innerHTML = ''; return; }
+  if (TAB === 'overview' || TAB === 'reccfg') { $('pager').innerHTML = ''; return; }
   var total = s.total || 0;
   var pages = Math.max(1, Math.ceil(total / LIMIT));
   var page = Math.floor(OFFSET / LIMIT) + 1;
@@ -498,10 +710,10 @@ function doAction(act, payloads) {
   var fail = function (err) { toast(actLabel(act) + ' 失败：' + err.message, true); loadTab(); };
   if (act === 'del-group') {
     var keys = payloads.map(function (p) { return p.groupKey; });
-    if (!confirm('删除 ' + keys.length + ' 个分组？\\n将断开其全部节点连接并清除路由数据。')) return;
+    if (!confirm('删除 ' + keys.length + ' 个分组？\\n将断开其全部节点连接并清除路由数据；\\n对应网络名将进入黑名单（可在「黑名单」页解除）。')) return;
     post('/api/group/delete', { groupKeys: keys }).then(done).catch(fail);
   } else if (act === 'kick') {
-    if (!confirm('踢出 ' + payloads.length + ' 个节点？')) return;
+    if (!confirm('踢出 ' + payloads.length + ' 个节点？\\n被踢出的 PeerId 将进入黑名单（可在「黑名单」页解除）。')) return;
     post('/api/peer/kick', { peers: payloads.map(function (p) { return { groupKey: p.groupKey, peerId: p.peerId }; }) }).then(done).catch(fail);
   } else if (act === 'del-route') {
     var byGroup = {};
@@ -518,15 +730,32 @@ function doAction(act, payloads) {
       return post('/api/peercenter/delete', { groupKey: gk, peerIds: byGroup2[gk] });
     })).then(done).catch(fail);
   } else if (act === 'close-sock') {
-    if (!confirm('断开 ' + payloads.length + ' 个连接？')) return;
+    if (!confirm('断开 ' + payloads.length + ' 个连接？\\n已知客户端 IP 将进入黑名单（可在「黑名单」页解除）。')) return;
     post('/api/socket/close', { socketIds: payloads.map(function (p) { return p.socketId; }) }).then(done).catch(fail);
   } else if (act === 'del-digest') {
-    if (!confirm('删除 ' + payloads.length + ' 条摘要注册？\\n将解除对应网络名注册并清除使用该摘要的分组。')) return;
+    if (!confirm('删除 ' + payloads.length + ' 条摘要注册？\\n将解除对应网络名注册并清除使用该摘要的分组；\\n对应网络名将进入黑名单（可在「黑名单」页解除）。')) return;
     post('/api/digest/delete', { networkNames: payloads.map(function (p) { return p.networkName; }) }).then(done).catch(fail);
+  } else if (act === 'del-record') {
+    if (!confirm('删除 ' + payloads.length + ' 条记录？')) return;
+    post('/api/records/delete', { type: REC_TYPE, ids: payloads.map(function (p) { return p.id; }) }).then(done).catch(fail);
+  } else if (act === 'clear-records') {
+    if (!confirm('清空「' + REC_TYPE_NAMES[REC_TYPE] + '」的全部记录？')) return;
+    post('/api/records/delete', { type: REC_TYPE, ids: 'all' }).then(done).catch(fail);
+  } else if (act === 'bl-remove-one' || act === 'bl-remove') {
+    if (!confirm('从黑名单移除 ' + payloads.length + ' 项？移除后对应节点/网络/IP 可重新接入。')) return;
+    post('/api/blacklist/delete', { cat: BL_CAT, ids: payloads.map(function (p) { return p.id; }) }).then(done).catch(fail);
+  } else if (act === 'bl-clear') {
+    if (!confirm('清空「' + BL_CAT_NAMES[BL_CAT] + '」类黑名单？')) return;
+    post('/api/blacklist/delete', { cat: BL_CAT, ids: 'all' }).then(done).catch(fail);
   }
 }
 function actLabel(act) {
-  return { 'del-group': '删除分组', 'kick': '踢出节点', 'del-route': '删除路由条目', 'del-pc': '删除互联条目', 'close-sock': '断开连接', 'del-digest': '删除摘要注册' }[act] || '操作';
+  return {
+    'del-group': '删除分组', 'kick': '踢出节点', 'del-route': '删除路由条目', 'del-pc': '删除互联条目',
+    'close-sock': '断开连接', 'del-digest': '删除摘要注册', 'del-record': '删除记录', 'clear-records': '清空记录',
+    'bl-remove': '移除黑名单', 'bl-remove-one': '移除黑名单', 'bl-clear': '清空黑名单', 'bl-add': '加入黑名单',
+    'save-reccfg': '保存记录设置'
+  }[act] || '操作';
 }
 
 function onBatch() {
@@ -539,6 +768,8 @@ function onBatch() {
   else if (TAB === 'peercenter') doAction('del-pc', payloads);
   else if (TAB === 'sockets') doAction('close-sock', payloads);
   else if (TAB === 'digests') doAction('del-digest', payloads);
+  else if (TAB === 'records') doAction('del-record', payloads);
+  else if (TAB === 'blacklist') doAction('bl-remove', payloads);
 }
 
 /* ---------------- 导航与初始化 ---------------- */
@@ -564,8 +795,9 @@ function setAuto() {
   if (window.__t) { clearInterval(window.__t); window.__t = null; }
   if ($('auto').checked) {
     window.__t = setInterval(function () {
-      // 自动刷新保留勾选；当前已在 overview 时无需重复拉取侧边栏计数
-      loadTab(true);
+      // 自动刷新保留勾选；当前已在 overview 时无需重复拉取侧边栏计数；
+      // 记录设置页不自动刷新（避免覆盖未保存的编辑）
+      if (TAB !== 'reccfg') loadTab(true);
       if (TAB !== 'overview') refreshSideCounters();
     }, 10000);
   }
