@@ -60,7 +60,7 @@ easytier-core --network-name myteam --network-secret s3cret! \
 |---|---|
 | [部署手册](docs/部署手册.md) | 快速部署、全部配置项（含 KV 审计）、域名绑定、成本额度、运维、FAQ |
 | [技术文档](docs/技术文档.md) | 协议实现详解、幽灵节点六重防线、KV 审计与黑名单设计、与官方对比、Hibernation 设计 |
-| [更新日志](docs/更新日志.md) | 各版本变更明细与发布前的开发历程 |
+| [更新日志](docs/更新日志.md) | 各版本变更明细 |
 
 ## 项目结构
 
