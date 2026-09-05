@@ -1,4 +1,4 @@
-# EasyTier Cloudflare Relay
+# EasyTier Cloudflare Relay V1.3.0
 
 在 Cloudflare Workers 免费额度内运行 EasyTier 自建 WebSocket 节点——无需 VPS，
 客户端 `-p wss://<你的域名>/` 即可组网。纯 P2P 优先（中继仅兜底），
