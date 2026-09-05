@@ -126,13 +126,14 @@ var TAB = 'overview';
 var OFFSET = 0;
 var LIMIT = 50;
 var GROUP_FILTER = '';
-var REC_TYPE = 'peers';   // 记录查询当前类型
+var REC_TYPE = 'all';    // 记录查询当前类型（默认"全部"，跨类型合并视图）
 var BL_CAT = 'peer';       // 黑名单当前类别
 var S = null;          // 当前 tab 响应
 var OVERVIEW = null;   // 最近一次 overview（侧边栏计数）
 var SEL = {};          // 勾选集合：key -> row 数据
 
 var REC_TYPE_NAMES = {
+  all: '全部',
   groups: '网络分组', peers: '节点在线', routes: '路由信息', peercenter: '全局互联',
   sockets: '连接列表', digests: '摘要注册表', admin: '管理端审计（硬记录）'
 };
@@ -149,7 +150,14 @@ var REMOVE_REASONS = {
 };
 
 function $(id){ return document.getElementById(id); }
-function esc(s){ var d = document.createElement('div'); d.textContent = s == null ? '' : String(s); return d.innerHTML; }
+/**
+ * HTML 转义（文本 + 属性双上下文安全）。
+ * 修复（v1.3.0）：textContent→innerHTML 只转义 & < >，不转义双引号——
+ * 此前 data-payload="{"id":5}" 的 JSON 引号会截断属性，导致列表"操作"列
+ * 按钮拿到的 payload 变成 "{"（JSON 解析失败退化为空对象），点击无实际效果。
+ * 现将双引号一并转义为 &quot;，属性与文本两种位置均可安全使用。
+ */
+function esc(s){ var d = document.createElement('div'); d.textContent = s == null ? '' : String(s); return d.innerHTML.replace(/"/g, '&quot;'); }
 function fmt(t){ return t ? new Date(t).toLocaleTimeString() : '-'; }
 function dur(ms){ if (ms == null) return '-'; var s = Math.floor(ms / 1000); if (s < 60) return s + 's'; if (s < 3600) return Math.floor(s / 60) + 'm' + (s % 60) + 's'; return Math.floor(s / 3600) + 'h' + Math.floor((s % 3600) / 60) + 'm'; }
 function toast(msg, isErr){ var t = $('toast'); t.textContent = msg; t.className = isErr ? 'err' : ''; t.style.display = 'block'; clearTimeout(t._h); t._h = setTimeout(function(){ t.style.display = 'none'; }, 3500); }
@@ -241,16 +249,18 @@ function renderChips(s) {
   }
   // 记录 / 记录设置 / 黑名单（非 state 端点，无 stats 结构）
   if (TAB === 'records') {
-    h += chip('该类记录', s.total, 'hl');
-    var cnt = (OVERVIEW && OVERVIEW.stats && OVERVIEW.stats.audit && OVERVIEW.stats.audit.records) || null;
-    if (cnt) h += chip('全部记录', cnt._total);
+    h += chip(REC_TYPE === 'all' ? '全部记录' : '该类记录', s.total, 'hl');
+    if (REC_TYPE !== 'all') {
+      var cnt = (OVERVIEW && OVERVIEW.stats && OVERVIEW.stats.audit && OVERVIEW.stats.audit.records) || null;
+      if (cnt) h += chip('全部记录', cnt._total);
+    }
     var kvOn = OVERVIEW && OVERVIEW.stats && OVERVIEW.stats.audit && OVERVIEW.stats.audit.kvEnabled;
     h += chip('KV 存储', kvOn ? '启用' : '未启用（仅 DO 存储）', kvOn ? 'good' : '');
   } else if (TAB === 'reccfg') {
     h += chip('KV 存储', s.kvEnabled ? '启用' : '未启用（仅 DO 存储）', s.kvEnabled ? 'good' : '');
     h += chip('KV 刷写间隔', s.flushMs ? dur(s.flushMs) : '-');
     h += chip('管理端审计', s.adminAudit ? '开（硬设置）' : '关（硬设置）', s.adminAudit ? 'good' : 'bad',
-      '由 wrangler.toml ADMIN_AUDIT 硬设置，管理页不可修改；记录管理员登录（IP/时间）、操作与查看');
+      '由 wrangler.toml ADMIN_AUDIT 硬设置，管理页不可修改；记录管理员登录（IP/时间）与操作（v1.3.0 起不再记录查看事件）');
   } else if (TAB === 'blacklist') {
     var bc = s.counts || {};
     h += chip('该类条目', s.total, 'hl');
@@ -349,7 +359,9 @@ function renderToolbar(s) {
     });
     h += '</select></label>';
     h += '<button class="act danger" id="batch" ' + (hasSel && !isAdminType ? '' : 'disabled') + (isAdminType ? ' title="管理端审计为硬记录，不可删除"' : '') + '>删除选中记录（' + Object.keys(SEL).length + '）</button>';
-    h += '<button class="act ghost" id="clearall" ' + (isAdminType ? 'disabled' : '') + '>清空该类</button>';
+    if (REC_TYPE !== 'all') {
+      h += '<button class="act ghost" id="clearall" ' + (isAdminType ? 'disabled' : '') + '>清空该类</button>';
+    }
     h += '<span class="sep"></span>';
   } else if (TAB === 'blacklist') {
     h += '<label>类别 <select id="blcat">';
@@ -397,7 +409,11 @@ function renderToolbar(s) {
 
 /* ---------------- 表格 ---------------- */
 function selBox(key, data) {
-  return '<input type="checkbox" data-sel="' + esc(key) + '"' + (SEL[key] ? ' checked' : '') + '>';
+  // 记录查询：admin 为硬记录不可删——admin 类型或"全部"视图中的 admin 行禁用勾选
+  var dis = TAB === 'records'
+    && (REC_TYPE === 'admin' || (REC_TYPE === 'all' && data && data.type === 'admin'));
+  return '<input type="checkbox" data-sel="' + esc(key) + '"' + (SEL[key] ? ' checked' : '')
+    + (dis ? ' disabled title="管理端审计为硬记录，不可选择删除"' : '') + '>';
 }
 function rowKey(it) {
   if (TAB === 'groups') return it.key;
@@ -431,12 +447,11 @@ function renderTable(s) {
   if (TAB === 'peercenter') h += '<th>分组</th><th>上报方 PeerId</th><th>直连节点</th><th>最近上报</th><th>操作</th>';
   if (TAB === 'sockets') h += '<th>ID</th><th>PeerId</th><th>分组</th><th>已握手</th><th>客户端 IP</th><th>连接时间</th><th>最近活动</th><th>操作</th>';
   if (TAB === 'digests') h += '<th>网络名</th><th>摘要</th><th>分组存在</th><th>操作</th>';
-  if (TAB === 'records') h += '<th>时间</th><th>事件</th><th>明细</th>' + (REC_TYPE === 'admin' ? '' : '<th>操作</th>');
+  if (TAB === 'records') h += (REC_TYPE === 'all' ? '<th>类型</th>' : '') + '<th>时间</th><th>事件</th><th>明细</th>' + (REC_TYPE === 'admin' ? '' : '<th>操作</th>');
   if (TAB === 'blacklist') h += '<th>值</th><th>加入时间</th><th>原因</th><th>附加</th><th>操作</th>';
   h += '</tr></thead><tbody>';
   items.forEach(function (it) {
     var k = rowKey(it);
-    var noSel = TAB === 'records' && REC_TYPE === 'admin';
     h += '<tr><td class="nosel">' + selBox(k, it) + '</td>';
     if (TAB === 'groups') {
       h += '<td>' + esc(it.networkName) + '</td><td>' + it.peerCount + '</td><td>' + it.routeCount + '</td><td>' + it.peerCenterCount +
@@ -467,10 +482,15 @@ function renderTable(s) {
       h += '<td>' + esc(it.networkName) + '</td><td><code>' + esc(String(it.digest).slice(0, 16)) + '…</code></td><td>' + (it.groupExists ? '是' : '否') +
         '</td><td>' + actionBtn('删除', 'del-digest', { networkName: it.networkName }) + '</td>';
     } else if (TAB === 'records') {
+      // admin 为硬记录：该行不可勾选/删除（"全部"视图按行的 type 判定）
+      var rowAdmin = REC_TYPE === 'admin' || (REC_TYPE === 'all' && it.type === 'admin');
       var ev = EVENT_LABELS[it.event] || it.event;
       if (it.count > 1) ev += ' ×' + it.count;
+      if (REC_TYPE === 'all') {
+        h += '<td><span class="muted">' + esc(REC_TYPE_NAMES[it.type] || it.type) + '</span></td>';
+      }
       h += '<td>' + new Date(it.ts).toLocaleString() + '</td><td>' + esc(ev) + '</td><td>' + recDetail(it) + '</td>';
-      if (!noSel) h += '<td>' + actionBtn('删除', 'del-record', { id: it.id }) + '</td>';
+      if (!rowAdmin) h += '<td>' + actionBtn('删除', 'del-record', { id: it.id }) + '</td>';
     } else if (TAB === 'blacklist') {
       h += '<td><code>' + esc(it.value) + '</code></td><td>' + new Date(it.ts).toLocaleString() + '</td><td>' + esc(it.reason || '-') + '</td><td>' +
         esc([it.groupKey, it.networkName, it.socketId != null ? 'socket #' + it.socketId : null].filter(Boolean).join(' · ') || '-') +
@@ -485,6 +505,8 @@ function renderTable(s) {
     if (sa.disabled) return;
     var checked = sa.checked;
     (s.items || []).forEach(function (it) {
+      // "全部"视图：admin 硬记录不可选（禁用行跳过）
+      if (TAB === 'records' && REC_TYPE === 'all' && it.type === 'admin') return;
       var k = rowKey(it);
       if (checked) SEL[k] = it; else delete SEL[k];
     });
@@ -517,7 +539,7 @@ function renderRecCfg(s) {
   h += '<div class="muted" style="margin-bottom:10px">每类信息只占一条 KV 键；关闭后该类事件不再记录，已存记录可到「记录查询」清空。</div>';
   h += '<table><thead><tr><th>记录类型</th><th>当前条数</th><th>启用</th><th>存储上限（条）</th></tr></thead><tbody>';
   Object.keys(REC_TYPE_NAMES).forEach(function (t) {
-    if (t === 'admin') return;
+    if (t === 'admin' || t === 'all') return; // admin 为硬设置；all 为查询视图（非记录类型）
     var c = types[t] || {};
     var n = (s.counts && s.counts[t]) != null ? s.counts[t] : '-';
     h += '<tr><td>' + REC_TYPE_NAMES[t] + '</td><td>' + n + '</td>' +
@@ -526,7 +548,7 @@ function renderRecCfg(s) {
   });
   h += '</tbody></table>';
   h += '<div style="margin-top:10px"><span class="tag on">管理端审计</span> ' +
-    (s.adminAudit ? '已启用（硬设置，上限 ' + s.adminAuditLimit + ' 条，记录管理员登录/操作/查看，管理页不可关闭或删除）'
+    (s.adminAudit ? '已启用（硬设置，上限 ' + s.adminAuditLimit + ' 条，记录管理员登录/操作，管理页不可关闭或删除；v1.3.0 起不再记录查看事件）'
       : '未启用（wrangler.toml ADMIN_AUDIT=0）') + '</div>';
   h += '<div class="muted" style="margin-top:8px">黑名单上限（硬设置）：' + esc(s.blacklistLimit) + ' 条/类；KV 刷写间隔：' +
     (s.flushMs ? dur(s.flushMs) : '-') + '；KV 存储：' + (s.kvEnabled ? '已启用' : '未启用（仅 DO 存储，功能不受影响）') + '</div>';
@@ -597,6 +619,10 @@ function renderOverview(s) {
   h += kv('数据转发', c.forwards);
   h += kv('协议错误', c.errors);
   h += kv('伪造拦截', c.forgeries);
+  h += kv('黑名单拦截', c.blRejected || 0, (c.blRejected || 0) > 0 ? 'bad' : 'good',
+    'DO 层（升级/握手）黑名单拒绝次数。v1.3.0 起拒绝不再逐条写记录（防重连风暴刷爆记录列表），' +
+    '改由此计数观测；边缘层（Worker 入口 KV 直读）拒绝的连接不经过 DO，不在此计数。' +
+    '计数随 DO 重启归零');
   h += '</div>';
   if (st.groups) {
     h += '<div class="card"><h3>网络分组（foreign-network）</h3>';

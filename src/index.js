@@ -15,7 +15,7 @@
  *     POST <ADMIN_PATH>/api/peercenter/delete 删除互联表条目（批量，需 ADMIN_TOKEN）
  *     POST <ADMIN_PATH>/api/socket/close      断开连接（批量，需 ADMIN_TOKEN）
  *     KV 审计（记录 + 黑名单）：
- *     GET  <ADMIN_PATH>/api/records          记录查询（?type=&offset=&limit=）
+ *     GET  <ADMIN_PATH>/api/records          记录查询（?type=&offset=&limit=，type 支持 all=跨类型合并）
  *     POST <ADMIN_PATH>/api/records/delete    删除记录（admin 类为硬审计不可删）
  *     GET  <ADMIN_PATH>/api/record/config     记录配置（每类开关 + 上限）
  *     POST <ADMIN_PATH>/api/record/config     修改记录配置
@@ -24,7 +24,8 @@
  *     POST <ADMIN_PATH>/api/blacklist/delete  黑名单移除（解除封锁）
  *                             （不配置 ADMIN_PATH + ADMIN_TOKEN 则完全禁用）
  * - 任意路径 WebSocket 升级 -> DO（官方客户端用用户配置的 URL，路径不定，
- *   官方服务端同样接受任意路径；保留路径除外）
+ *   官方服务端同样接受任意路径；保留路径除外）。升级前先做边缘层
+ *   socket（IP）黑名单拦截：KV 直读 bl:socket 一条键，命中 403 不唤醒 DO
  * - 其余请求 404
  *
  * 鉴权说明（P0 整改）：
@@ -37,6 +38,7 @@
  */
 import { RelayRoom } from './room.js';
 import { ADMIN_HTML } from './admin_ui.js';
+import { BL_SOCKET_KV_KEY } from './audit.js';
 
 export { RelayRoom };
 
@@ -130,6 +132,27 @@ export default {
     // WebSocket 升级（EasyTier 客户端）
     if (request.headers.get('Upgrade') === 'websocket'
         && !isReservedPath(url.pathname, metricsPath, adminPath)) {
+      // 边缘层 socket（IP）黑名单拦截（v1.3.0）：直接读 KV 的 bl:socket 一条键，
+      // 命中立即 403 —— 不唤醒 Durable Object，被拉黑客户端的重连风暴
+      // 只消耗 Worker 请求额度，不再消耗 DO 请求与时长计费。
+      // - CF-Connecting-IP 由 Cloudflare 边缘注入，客户端不可伪造（生产环境）；
+      // - KV 为最终一致（约 1 分钟）：新拉黑的 IP 由 DO 升级/握手层权威兜底，
+      //   解除封锁后至多约 1 分钟内恢复可连；
+      // - 未绑定 AUDIT_KV 或读取异常时跳过本层，回落到 DO 内检查（功能不变）。
+      if (env.AUDIT_KV) {
+        const clientIp = request.headers.get('CF-Connecting-IP') || '';
+        if (clientIp) {
+          try {
+            const bl = await env.AUDIT_KV.get(BL_SOCKET_KV_KEY, 'json');
+            if (Array.isArray(bl) && bl.some((e) => e && e.value === clientIp)) {
+              return new Response('Forbidden', {
+                status: 403,
+                headers: { 'retry-after': '60' }, // 建议客户端退避重试
+              });
+            }
+          } catch { /* KV 读失败：放行走 DO 权威检查 */ }
+        }
+      }
       const roomId = resolveRoomId(request, url, env);
       const stub = env.RELAY_ROOM.get(env.RELAY_ROOM.idFromName(roomId));
       return stub.fetch(request);

@@ -70,8 +70,8 @@ export function buildConfig(env) {
   return {
     serverPeerId: int(env, 'SERVER_PEER_ID', 10000001) >>> 0,
     serverNetworkName: str(env, 'SERVER_NETWORK_NAME', 'public_server'),
-    serverHostname: str(env, 'SERVER_HOSTNAME', 'cf-relay'),
-    serverVersionStr: str(env, 'SERVER_VERSION_STR', 'et-cf-relay/1.2.0'),
+    serverHostname: str(env, 'SERVER_HOSTNAME', 'easytier-cf-relay'),
+    serverVersionStr: str(env, 'SERVER_VERSION_STR', 'easytier-cf-relay/1.3.0'),
     avoidRelayData: bool(env, 'AVOID_RELAY_DATA', true),
     relayData: bool(env, 'RELAY_DATA', true),
     maxPeersPerRoom: int(env, 'MAX_PEERS_PER_ROOM', 64),
@@ -134,6 +134,9 @@ export class RelayRoom {
     this.counters = {
       msgsIn: 0, msgsOut: 0, bytesIn: 0, bytesOut: 0,
       forwards: 0, connsTotal: 0, errors: 0, forgeries: 0,
+      // 黑名单拦截次数（v1.3.0：拒绝不再逐条写记录，改由计数器观测；
+      // 边缘层【Worker 入口】拒绝的连接不会到达 DO，不在此计数）
+      blRejected: 0,
     };
     this.startedAt = Date.now();
     this._dirty = false;
@@ -231,7 +234,7 @@ export class RelayRoom {
       return Response.json(this._stats());
     }
     // 以下管理端内部端点仅由 Worker 入口在鉴权后转发调用（DO 无外部直达路径）。
-    // x-admin-ip 为管理员来源 IP（Worker 入口注入），用于管理端审计（登录/操作/查看）。
+    // x-admin-ip 为管理员来源 IP（Worker 入口注入），用于管理端审计（登录/操作）。
     const adminIp = request.headers.get('x-admin-ip') || '';
     if (path === '/internal/state' && request.method === 'GET') {
       this.audit.adminTouch(adminIp, 'view');
@@ -243,7 +246,7 @@ export class RelayRoom {
         groupKey: q.get('groupKey') || '',
       }));
     }
-    // KV 审计：记录查询（type ∈ groups|peers|routes|peercenter|sockets|digests|admin）
+    // KV 审计：记录查询（type ∈ groups|peers|routes|peercenter|sockets|digests|admin|all）
     if (path === '/internal/records' && request.method === 'GET') {
       this.audit.adminTouch(adminIp, 'view');
       const q = url.searchParams;
@@ -254,7 +257,7 @@ export class RelayRoom {
       );
       return Response.json({ ok: true, ...r });
     }
-    // KV 审计：删除记录（admin 类为硬审计，不可删）
+    // KV 审计：删除记录（admin 类为硬审计不可删；type=all 按 id 跨类型删除）
     if (path === '/internal/records/delete' && request.method === 'POST') {
       const body = await request.json().catch(() => ({}));
       const r = this.audit.deleteRecords(body.type, body.ids);
@@ -343,14 +346,21 @@ export class RelayRoom {
     if (request.headers.get('Upgrade') !== 'websocket') {
       return new Response('Expected WebSocket upgrade', { status: 400 });
     }
-    // 客户端 IP（黑名单 socket 类拦截 + 审计记录）
+    // 客户端 IP（黑名单 socket 类拦截 + 审计记录）。
+    // 注：配置了 AUDIT_KV 时，Worker 入口已先做过边缘层 socket 黑名单拦截
+    //（KV 直读，不唤醒 DO）；此处为权威兜底（KV 最终一致窗口内的新拉黑 IP）。
     const clientIp = request.headers.get('CF-Connecting-IP') || '';
     if (clientIp) {
       const bl = this.audit.checkAccess({ ip: clientIp });
       if (bl.blocked) {
-        this.audit.record('peers', { event: 'reject', ip: clientIp, cause: `blacklist:${bl.cat}` });
+        // v1.3.0：拒绝不写入 peers 记录（被拉黑客户端会不断重连，逐条记录
+        // 会刷爆记录列表并徒增写入额度），只计数 + 打日志
+        this.counters.blRejected += 1;
         this.log.warn(`connection rejected (ip blacklist): ip=${clientIp}`);
-        return new Response('Forbidden', { status: 403 });
+        return new Response('Forbidden', {
+          status: 403,
+          headers: { 'retry-after': '60' }, // 建议客户端退避重试
+        });
       }
     }
     if (this.pm.totalPeers() >= this.config.maxPeersPerRoom) {
@@ -619,10 +629,8 @@ export class RelayRoom {
     {
       const bl = this.audit.checkAccess({ ip: ws._clientIp || undefined, peerId, networkName });
       if (bl.blocked) {
-        this.audit.record('peers', {
-          event: 'reject', peerId, networkName, cause: `blacklist:${bl.cat}`,
-          ...(ws._clientIp ? { ip: ws._clientIp } : {}),
-        });
+        // v1.3.0：拒绝不写入 peers 记录（防重连风暴刷爆记录列表），只计数
+        this.counters.blRejected += 1;
         this.log.warn(
           `handshake rejected (blacklist:${bl.cat}) network="${networkName}" peer=${peerId} value=${bl.value}`
         );

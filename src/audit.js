@@ -5,6 +5,7 @@
  * 1. 键值布局 —— 每类信息只占一条 KV 键：
  *    - 记录：et-relay:rec:<type>，type ∈ groups|peers|routes|peercenter|sockets|digests|admin
  *    - 黑名单：et-relay:bl:<cat>，cat ∈ peer|group|digest|socket
+ *    - 记录查询支持 type=all：跨类型按 id（全局时序）倒序合并，无需额外 KV 键
  * 2. 三级写入路径：
  *    - 事件发生 → 仅写内存（零成本）；
  *    - alarm 周期（15s）→ 脏数据刷入 DO storage（SQLite，免费额度充裕，防休眠丢失）；
@@ -12,11 +13,16 @@
  *    KV 免费额度 1000 写/天：默认间隔下每键最多 144 写/天，典型小网络
  *    （每天几十次连接波动）实际写入远低于该值。
  * 3. 读取路径：管理端查询直接读内存；仅冷启动且 DO storage 为空时回读 KV
- *    （每键一次，全生命周期最多一次）。
- * 4. 管理端审计（登录/操作/查看）为硬设置（wrangler.toml ADMIN_AUDIT），
+ *    （每键一次，全生命周期最多一次）。Worker 入口的边缘黑名单拦截只读
+ *    bl:socket 一条键（BL_SOCKET_KV_KEY），被拒连接不唤醒 DO。
+ * 4. 管理端审计（登录/操作）为硬设置（wrangler.toml ADMIN_AUDIT），
  *    管理页不可关闭；六类数据记录可由管理页单独开关并设置上限。
+ *    v1.3.0 起不再记录"查看"事件（管理页 10s 自动刷新会刷屏且徒增写入）。
  * 5. 黑名单分四类（peer/group/digest/socket），管理操作（踢出/删除分组/
- *    删除摘要/断开连接）自动记录进对应类别；握手时按类别拦截。
+ *    删除摘要/断开连接）自动记录进对应类别；接入拦截分两层：
+ *    Worker 入口边缘层（仅 socket/IP 类，KV 直读）+ DO 握手/升级层（权威兜底）。
+ * 6. 黑名单拒绝不再产生 peers 记录（被拉黑客户端会不断重连，逐条记录会
+ *    刷爆记录列表并浪费写入额度）；拒绝次数改由 room.js 计数器统计。
  */
 
 export const RECORD_TYPES = ['groups', 'peers', 'routes', 'peercenter', 'sockets', 'digests', 'admin'];
@@ -25,8 +31,11 @@ export const BLACKLIST_CATS = ['peer', 'group', 'digest', 'socket'];
 
 const STATE_KEY = 'audit_state';
 const KV_PREFIX = 'et-relay:';
-/** 管理端审计：同一 IP 的查看记录折叠窗口（管理页 10s 自动刷新不刷屏） */
-const VIEW_DEDUP_MS = 5 * 60_000;
+/**
+ * socket（客户端 IP）黑名单的 KV 键：Worker 入口边缘拦截只读这一条键，
+ * 命中直接 403，不唤醒 Durable Object（省 DO 请求与时长计费）。
+ */
+export const BL_SOCKET_KV_KEY = KV_PREFIX + 'bl:socket';
 /** 管理端审计：同一 IP 的登录记录折叠窗口 */
 const LOGIN_DEDUP_MS = 10 * 60_000;
 
@@ -72,7 +81,6 @@ export class AuditStore {
     this._kvDirty = new Set();    // 需要镜像到 KV 的键名（rec:xxx / bl:xxx）
     this._lastKvFlush = 0;
     this._lastLoginByIp = new Map(); // ip -> ts（登录去重）
-    this._lastViewIdByIp = new Map(); // ip -> 最近一条查看记录 id（计数折叠）
   }
 
   // -------------------------------------------------------------------
@@ -211,7 +219,25 @@ export class AuditStore {
     this._kvDirty.add('rec:' + type);
   }
 
+  /**
+   * 分页查询记录。
+   * @param {string} type RECORD_TYPES 之一，或 'all'（跨类型合并：
+   *        每条附带 type 字段，按全局 id 倒序即时间倒序，admin 硬记录一并展示）
+   */
   listRecords(type, offset = 0, limit = 50) {
+    if (type === 'all') {
+      const merged = [];
+      for (const t of RECORD_TYPES) {
+        for (const r of this.records.get(t) || []) merged.push({ ...r, type: t });
+      }
+      merged.sort((a, b) => b.id - a.id);
+      return {
+        total: merged.length,
+        offset,
+        limit,
+        items: merged.slice(offset, offset + limit),
+      };
+    }
     if (!RECORD_TYPES.includes(type)) return { total: 0, items: [] };
     const arr = this.records.get(type) || [];
     const items = arr.slice().reverse(); // 最新在前
@@ -223,8 +249,39 @@ export class AuditStore {
     };
   }
 
-  /** 删除记录（单个/批量/清空）。admin 类记录不可通过管理页删除（硬审计）。 */
+  /**
+   * 删除记录（单个/批量/清空）。admin 类记录不可通过管理页删除（硬审计）。
+   * type='all' 时按 id 跨类型删除（ids='all' 清空全部六类数据记录），admin 永不删除。
+   */
   deleteRecords(type, ids) {
+    if (type === 'all') {
+      let removed = 0;
+      if (ids === 'all') {
+        for (const t of RUNTIME_TYPES) {
+          const arr = this.records.get(t);
+          removed += arr.length;
+          if (arr.length) {
+            arr.length = 0;
+            this._touch('rec:' + t);
+          }
+        }
+        return { ok: true, removed };
+      }
+      const wanted = new Set((ids || []).map(Number));
+      for (const t of RUNTIME_TYPES) {
+        const arr = this.records.get(t);
+        let changed = false;
+        for (let i = arr.length - 1; i >= 0; i--) {
+          if (wanted.has(arr[i].id)) {
+            arr.splice(i, 1);
+            removed += 1;
+            changed = true;
+          }
+        }
+        if (changed) this._touch('rec:' + t);
+      }
+      return { ok: true, removed };
+    }
     if (!RECORD_TYPES.includes(type)) return { ok: false, error: 'bad_type' };
     if (type === 'admin') return { ok: false, error: 'admin_audit_immutable' };
     const arr = this.records.get(type);
@@ -383,42 +440,22 @@ export class AuditStore {
   }
 
   // -------------------------------------------------------------------
-  // 管理端审计（登录 / 查看 / 操作）
+  // 管理端审计（登录 / 操作）
   // -------------------------------------------------------------------
 
-  /** 管理端已鉴权请求入口：登录去重 + 查看折叠计数 */
+  /**
+   * 管理端已鉴权请求入口：登录去重记录 + 操作明细记录。
+   * v1.3.0 起"查看"（view）不再产生记录——管理页 10s 自动刷新会持续刷屏，
+   * 且每条都会产生 DO storage/KV 写入；查看类请求仅触发登录去重判定。
+   */
   adminTouch(ip, kind, detail) {
     const now = Date.now();
-    if (kind === 'view') {
-      const lastLogin = this._lastLoginByIp.get(ip) || 0;
-      if (now - lastLogin > LOGIN_DEDUP_MS) {
-        this._lastLoginByIp.set(ip, now);
-        this.record('admin', { event: 'login', ip });
-      }
-      const lastId = this._lastViewIdByIp.get(ip);
-      const arr = this.records.get('admin');
-      const last = lastId != null ? arr.find((r) => r.id === lastId) : null;
-      if (last && now - last.ts <= VIEW_DEDUP_MS) {
-        last.ts = now;
-        last.count = (last.count || 1) + 1;
-        this._storageDirty = true;
-        this._kvDirty.add('rec:admin');
-        return;
-      }
-      this.seq += 1;
-      arr.push({ id: this.seq, ts: now, event: 'view', ip, count: 1 });
-      if (arr.length > this.adminAuditLimit) arr.splice(0, arr.length - this.adminAuditLimit);
-      this._lastViewIdByIp.set(ip, this.seq);
-      this._storageDirty = true;
-      this._kvDirty.add('rec:admin');
-      return;
-    }
-    // kind === 'op'（或其它显式事件）：登录去重后记录操作明细
     const lastLogin = this._lastLoginByIp.get(ip) || 0;
     if (now - lastLogin > LOGIN_DEDUP_MS) {
       this._lastLoginByIp.set(ip, now);
       this.record('admin', { event: 'login', ip });
     }
+    if (kind === 'view') return; // 查看不记录（v1.3.0）
     this.record('admin', { event: kind || 'op', ip, ...(detail || {}) });
   }
 

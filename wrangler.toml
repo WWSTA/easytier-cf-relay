@@ -3,7 +3,7 @@
 
 name = "easytier-cf-relay"
 main = "src/index.js"
-compatibility_date = "2024-09-01"
+compatibility_date = "2026-09-05"
 compatibility_flags = ["nodejs_compat"]
 
 # WebSocket Hibernation 需要的最低兼容日期为 2024-04-03
@@ -16,9 +16,7 @@ SERVER_PEER_ID = "10000001"
 # 服务端在握手响应中宣告的网络名（与客户端网络名不同 => 外部网络中继模式）
 SERVER_NETWORK_NAME = "public_server"
 SERVER_HOSTNAME = "easytier-cf-relay"
-SERVER_VERSION_STR = "easytier-cf-relay/1.2.0"
-# 指定 Durable Object 地区配置（可选值：wnam 西部地区（北美）enam 东部地区（北美）sam 南美洲 weur 西欧 eeur 东欧 apac	亚太地区（已设置，默认未开启） oc 大洋洲 afr 非洲 me 中东）
-# LOCATION_HINT = "apac"
+SERVER_VERSION_STR = "easytier-cf-relay/1.3.0"
 # 纯 P2P 模式：1 = 在 feature_flag 中宣告 avoid_relay_data（OSPF 给本节点边赋大代价，
 # 客户端优先直连 P2P，中继仅作兜底）；0 = 不宣告
 AVOID_RELAY_DATA = "1"
@@ -60,13 +58,13 @@ LOG_LEVEL = "info"
 # 免费额度 1000 写/天：默认 10 分钟间隔下每键最多 144 写/天
 RECORD_FLUSH_MS = "600000"
 # 各类记录默认条数上限（管理页可单独调整）
-RECORD_DEFAULT_LIMIT = "200"
+RECORD_DEFAULT_LIMIT = "100"
 # 各类黑名单条数上限（硬设置）
-BLACKLIST_LIMIT = "2000"
+BLACKLIST_LIMIT = "1000"
 # 管理端审计硬开关：记录管理员登录（IP/时间）、操作、查看信息。
 # 这是硬设置 —— 管理页无法关闭 admin 类记录，也无法删除其内容
 ADMIN_AUDIT = "1"
-ADMIN_AUDIT_LIMIT = "400"
+ADMIN_AUDIT_LIMIT = "200"
 # 可选：JSON 映射 {"网络名":"网络密钥"}，配置后服务端校验客户端摘要（SipHash-1-3）
 # NETWORK_SECRETS = "{\"default\":\"my-secret\"}"
 # 可选：DO 房间分片。默认单一房间 "global"；配置后可按 Header/Query 切分房间
