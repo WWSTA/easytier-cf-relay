@@ -7,9 +7,12 @@
  *                             原 /health 返回 404（防指纹扫描）
  * - GET <METRICS_PATH>        统计端点：自定义安全路径 + METRICS_TOKEN 双重防护
  *                             （不配置 METRICS_PATH 则完全禁用，默认 404）
+ *                             v1.6.0：?format=prometheus 输出 Prometheus 文本格式
  * - GET <ADMIN_PATH>          Web 管理端页面壳（无数据）
  *     GET  <ADMIN_PATH>/api/state        分页状态（?tab=&offset=&limit=&groupKey=，需 ADMIN_TOKEN）
  *     GET  <ADMIN_PATH>/api/metrics      统计别名（需 ADMIN_TOKEN）
+ *     GET  <ADMIN_PATH>/api/quota        账号级真实额度（v1.6，需 ADMIN_TOKEN；token 不下发浏览器）
+ *     GET  <ADMIN_PATH>/api/trends       AE 趋势数据（v1.6，?window=24h|7d，需 ADMIN_TOKEN）
  *     POST <ADMIN_PATH>/api/group/delete     删除分组（单个/批量/全部，需 ADMIN_TOKEN）
  *     POST <ADMIN_PATH>/api/peer/kick        踢出节点（单个/批量，需 ADMIN_TOKEN）
  *     POST <ADMIN_PATH>/api/route/delete     删除路由条目（批量，需 ADMIN_TOKEN）
@@ -42,6 +45,7 @@ import { RelayRoom } from './room.js';
 import { ADMIN_HTML } from './admin_ui.js';
 import { FAVICON_PNG } from './assets.js';
 import { BL_SOCKET_KV_KEY } from './audit.js';
+import { statsToPrometheus } from './prometheus.js';
 
 export { RelayRoom };
 
@@ -163,6 +167,7 @@ export default {
     }
 
     // 统计：自定义安全路径 + token（P0 整改：两者都未配置则完全禁用，fail-closed）
+    // v1.6.0：?format=prometheus 输出 Prometheus 文本格式（鉴权同 JSON）
     if (metricsPath && url.pathname === metricsPath) {
       const token = str(env, 'METRICS_TOKEN', '');
       if (!token || !safeEqual(bearerToken(request, url), token)) {
@@ -170,7 +175,22 @@ export default {
       }
       const roomId = resolveRoomId(request, url, env);
       const stub = env.RELAY_ROOM.get(env.RELAY_ROOM.idFromName(roomId));
-      return stub.fetch(new Request('https://do/internal/stats', { method: 'GET' }));
+      if (url.searchParams.get('format') === 'prometheus') {
+        const res = await stub.fetch(new Request('https://do/internal/stats', { method: 'GET' }));
+        const stats = await res.json();
+        return new Response(statsToPrometheus(stats), {
+          headers: {
+            'content-type': 'text/plain; version=0.0.4; charset=utf-8',
+            'cache-control': 'no-store',
+          },
+        });
+      }
+      // /metrics 在 handleAdmin 作用域之外（doInternal 不可见）；统计 JSON
+      // 本身无缓存指令，但管理 API 统一 no-store：这里直接补头
+      const statsRes = await stub.fetch(new Request('https://do/internal/stats', { method: 'GET' }));
+      const h2 = new Headers(statsRes.headers);
+      h2.set('cache-control', 'no-store');
+      return new Response(statsRes.body, { status: statsRes.status, headers: h2 });
     }
 
     // 管理端：页面壳公开（无数据），API 一律 token 鉴权
@@ -231,13 +251,18 @@ export default {
 async function handleAdmin(request, url, env, adminPath) {
   const sub = url.pathname.slice(adminPath.length) || '/';
 
-  // 页面壳（无数据，无需鉴权）
+  // 页面壳（无数据，无需鉴权）。防嵌套双头：
+  // X-Frame-Options 兼容旧浏览器，CSP frame-ancestors 为现代标准——
+  // 管理页含批量删除/踢人/拉黑等高危操作，拒绝被恶意网站 iframe 嵌套
+  // 诱导已登录管理员点击（点击劫持）。
   if (sub === '/' && request.method === 'GET') {
     return new Response(ADMIN_HTML, {
       headers: {
         'content-type': 'text/html; charset=utf-8',
         'cache-control': 'no-store',
         'x-content-type-options': 'nosniff',
+        'x-frame-options': 'DENY',
+        'content-security-policy': "frame-ancestors 'none'",
       },
     });
   }
@@ -250,6 +275,13 @@ async function handleAdmin(request, url, env, adminPath) {
 
   const roomId = resolveRoomId(request, url, env);
   const stub = env.RELAY_ROOM.get(env.RELAY_ROOM.idFromName(roomId));
+  // 管理 API 响应统一 no-store：状态/记录含拓扑与 IP
+  // 明细，不应进入任何缓存（页面壳此前已有 no-store，API 缺失）。
+  const doInternal = (reqOrUrl, init) => stub.fetch(reqOrUrl, init).then((r) => {
+    const h = new Headers(r.headers);
+    h.set('cache-control', 'no-store');
+    return new Response(r.body, { status: r.status, statusText: r.statusText, headers: h });
+  });
   // 管理员来源 IP（DO 内部端点用于审计登录/操作/查看）
   const adminHeaders = {
     'content-type': 'application/json',
@@ -259,40 +291,49 @@ async function handleAdmin(request, url, env, adminPath) {
   if (sub === '/api/state' && request.method === 'GET') {
     // 分页参数透传（tab/offset/limit/groupKey）
     const qs = url.searchParams.toString();
-    return stub.fetch(new Request(`https://do/internal/state${qs ? '?' + qs : ''}`, {
+    return doInternal(new Request(`https://do/internal/state${qs ? '?' + qs : ''}`, {
       method: 'GET',
       headers: { 'x-admin-ip': adminHeaders['x-admin-ip'] },
     }));
   }
   if (sub === '/api/metrics' && request.method === 'GET') {
-    return stub.fetch(new Request('https://do/internal/stats', { method: 'GET' }));
+    return doInternal(new Request('https://do/internal/stats', { method: 'GET' }));
+  }
+  // 账号级真实额度（v1.6.0 A6）：CF_API_TOKEN 只在 DO 内使用，绝不下发浏览器
+  if (sub === '/api/quota' && request.method === 'GET') {
+    return doInternal(new Request('https://do/internal/quota', { method: 'GET' }));
+  }
+  // AE 趋势（v1.6.0 A5/D2）：window 参数透传，AE SQL 查询在 DO 内出站完成
+  if (sub === '/api/trends' && request.method === 'GET') {
+    const qs = url.searchParams.toString();
+    return doInternal(new Request(`https://do/internal/trends${qs ? '?' + qs : ''}`, { method: 'GET' }));
   }
 
   // KV 审计：记录查询 / 记录删除 / 记录配置
   if (sub === '/api/records' && request.method === 'GET') {
     const qs = url.searchParams.toString();
-    return stub.fetch(new Request(`https://do/internal/records${qs ? '?' + qs : ''}`, {
+    return doInternal(new Request(`https://do/internal/records${qs ? '?' + qs : ''}`, {
       method: 'GET',
       headers: { 'x-admin-ip': adminHeaders['x-admin-ip'] },
     }));
   }
   if (sub === '/api/record/config') {
     if (request.method === 'GET') {
-      return stub.fetch(new Request('https://do/internal/record/config', {
+      return doInternal(new Request('https://do/internal/record/config', {
         method: 'GET',
         headers: { 'x-admin-ip': adminHeaders['x-admin-ip'] },
       }));
     }
     if (request.method === 'POST') {
       const body = await request.text();
-      return stub.fetch(new Request('https://do/internal/record/config', {
+      return doInternal(new Request('https://do/internal/record/config', {
         method: 'POST', headers: adminHeaders, body,
       }));
     }
   }
   if (sub === '/api/records/delete' && request.method === 'POST') {
     const body = await request.text();
-    return stub.fetch(new Request('https://do/internal/records/delete', {
+    return doInternal(new Request('https://do/internal/records/delete', {
       method: 'POST', headers: adminHeaders, body,
     }));
   }
@@ -300,20 +341,20 @@ async function handleAdmin(request, url, env, adminPath) {
   // 黑名单：查询 / 添加 / 移除
   if (sub === '/api/blacklist' && request.method === 'GET') {
     const qs = url.searchParams.toString();
-    return stub.fetch(new Request(`https://do/internal/blacklist${qs ? '?' + qs : ''}`, {
+    return doInternal(new Request(`https://do/internal/blacklist${qs ? '?' + qs : ''}`, {
       method: 'GET',
       headers: { 'x-admin-ip': adminHeaders['x-admin-ip'] },
     }));
   }
   if (sub === '/api/blacklist/add' && request.method === 'POST') {
     const body = await request.text();
-    return stub.fetch(new Request('https://do/internal/blacklist/add', {
+    return doInternal(new Request('https://do/internal/blacklist/add', {
       method: 'POST', headers: adminHeaders, body,
     }));
   }
   if (sub === '/api/blacklist/delete' && request.method === 'POST') {
     const body = await request.text();
-    return stub.fetch(new Request('https://do/internal/blacklist/delete', {
+    return doInternal(new Request('https://do/internal/blacklist/delete', {
       method: 'POST', headers: adminHeaders, body,
     }));
   }
@@ -329,7 +370,7 @@ async function handleAdmin(request, url, env, adminPath) {
   const internalPath = postRoutes[sub];
   if (internalPath && request.method === 'POST') {
     const body = await request.text();
-    return stub.fetch(new Request(`https://do${internalPath}`, {
+    return doInternal(new Request(`https://do${internalPath}`, {
       method: 'POST',
       headers: adminHeaders,
       body,

@@ -88,3 +88,29 @@ export const ROUTE_INFO_TTL_MS = 3_660_000;
 
 /** 空分组自动删除宽限（毫秒）：分组内在线节点归零后持续该时长仍为空则整组删除 */
 export const GROUP_AUTO_DELETE_MS = 60_000;
+
+// ---------------------------------------------------------------------------
+// 资源滥用防线（v1.6.0）：
+// 全部为处理途中的同步检查——零新增请求路径 / KV 键 / 定时器，免费额度零开销。
+// 上限经 env 可配（0 = 关闭该防线），默认值对合法客户端留数倍余量：
+// 默认房间 64 peer / 分组 32 peer（部署手册 §5.3）。
+//
+// 上限自洽不变量（unit_test 锁定，运维改大配置时 room 启动日志 warn 提醒）：
+//   MAX_ROUTES_PER_GROUP × MAX_ROUTE_INFO_BYTES = 128 × 768 = 96 KiB
+//   < MAX_MESSAGE_BYTES(128 KiB) —— 合法全量路由推送永不触发出站硬闸。
+// ---------------------------------------------------------------------------
+
+/** 单帧 SyncRouteInfo 路由条目数上限：超出整帧拒绝（close 4009，与入站超大消息同类）。默认 256 = 默认房间 64 peer 的 4× 余量 */
+export const MAX_SYNC_ITEMS = 256;
+/** 单条 RoutePeerInfo 原始字节上限：超出丢弃该条（防巨型条目状态膨胀；官方典型条目 ~100-300B） */
+export const MAX_ROUTE_INFO_BYTES = 768;
+/** 每分组路由条目总数上限：transit/幽灵条目的总量闸门，兼作出站全量推送的体积上界 */
+export const MAX_ROUTES_PER_GROUP = 128;
+/** ReportPeers 单上报者 directPeers 条目上限：控制 GetGlobalPeerMap 响应体积 */
+export const MAX_DIRECT_PEERS_REPORT = 64;
+/** 全量重推最小间隔（毫秒）：会话重置与 GetGlobalPeerMap 全量响应共用的每连接冷却 */
+export const FULL_RESYNC_COOLDOWN_MS = 1000;
+/** 握手网络名长度上限：超长网络名会直接进 groupKey/持久化 */
+export const MAX_NETWORK_NAME_BYTES = 128;
+/** 持久化单值预算（字节）：DO storage 单值上限 128 KiB，留余量；超限走两段降级 */
+export const PERSIST_BUDGET_BYTES = 96 * 1024;

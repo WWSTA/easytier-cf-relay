@@ -41,10 +41,41 @@ const LEGACY_KV_PREFIX = 'et-relay:';
 export const BL_SOCKET_KV_KEY = KV_PREFIX + 'bl:socket';/** 管理端审计：同一 IP 的登录记录折叠窗口 */
 const LOGIN_DEDUP_MS = 10 * 60_000;
 
+/** 摘要抢占嫌疑（squat-suspect）记录的去重窗口与去重表上限 */
+const SQUAT_DEDUP_MS = 10 * 60_000;
+const SQUAT_DEDUP_MAX = 512;
+
 /** 黑名单类别与记录类别的合法值归一化（peer 为数字，其余为字符串） */
 function normValue(cat, value) {
   if (cat === 'peer') return Number(value);
   return String(value ?? '');
+}
+
+/**
+ * IP 打码（v1.6.0 C4 数据最小化，AUDIT_IP_MASK）：
+ * - IPv4 保留 /16 前缀：`1.2.3.4` → `1.2.x.x`（含 IPv4-mapped IPv6 `::ffff:1.2.3.4`）；
+ * - IPv6 保留前 4 组：`2001:db8:1234:5678::1` → `2001:db8:1234:5678:x`。
+ * 仅作用于【记录展示】——黑名单存储、踢人拉黑、边缘层 KV 拦截均使用完整 IP，
+ * 不受影响（打码只在 record() 写入时发生）。
+ */
+export function maskIp(ip) {
+  const s = String(ip ?? '');
+  if (!s) return s;
+  if (s.includes('.')) {
+    const m = s.match(/(\d{1,3}\.\d{1,3})\./);
+    return m ? `${m[1]}.x.x` : 'x';
+  }
+  if (s.includes(':')) {
+    // 展开 '::' 折叠后取前 4 组（/64 前缀）：fe80::1 → fe80:0:0:0:x，2001:db8::8:8 → 2001:db8:0:0:x
+    const h = s.split('::');
+    const head = h[0] ? h[0].split(':') : [];
+    const tail = h.length > 1 && h[1] ? h[1].split(':') : [];
+    const fill = h.length > 1 ? Math.max(0, 8 - head.length - tail.length) : 0;
+    const groups = head.concat(Array(fill).fill('0'), tail);
+    const first4 = groups.slice(0, 4).join(':');
+    return first4 ? `${first4}:x` : 'x';
+  }
+  return 'x';
 }
 
 export class AuditStore {
@@ -57,6 +88,8 @@ export class AuditStore {
    *   - blacklistLimit: 各类黑名单上限（BLACKLIST_LIMIT，硬设置）
    *   - adminAudit: 管理端审计硬开关（ADMIN_AUDIT）
    *   - adminAuditLimit: 管理端审计上限（ADMIN_AUDIT_LIMIT，硬设置）
+   *   - ipMask: 记录 IP 打码（AUDIT_IP_MASK，v1.6.0 C4；黑名单不受影响）
+   *   - retentionDays: 记录留存天数（AUDIT_RETENTION_DAYS，0=不限，v1.6.0 C4）
    *   - log: logger
    */
   constructor(opts = {}) {
@@ -67,6 +100,8 @@ export class AuditStore {
     this.blacklistLimit = Number(opts.blacklistLimit) > 0 ? Number(opts.blacklistLimit) : 1000;
     this.adminAudit = opts.adminAudit !== false;
     this.adminAuditLimit = Number(opts.adminAuditLimit) > 0 ? Number(opts.adminAuditLimit) : 200;
+    this.ipMask = opts.ipMask === true;
+    this.retentionDays = Number(opts.retentionDays) > 0 ? Math.floor(Number(opts.retentionDays)) : 0;
     this.log = opts.log || { warn: () => {}, debug: () => {} };
 
     /** @type {Map<string, object[]>} type -> 记录数组（旧→新） */
@@ -83,6 +118,9 @@ export class AuditStore {
     this._kvDirty = new Set();    // 需要镜像到 KV 的键名（rec:xxx / bl:xxx）
     this._lastKvFlush = 0;
     this._lastLoginByIp = new Map(); // ip -> ts（登录去重）
+    // 摘要抢占嫌疑去重：key "网络名|ip" -> ts，
+    // 定长 FIFO 防无界增长（与 _lastLoginByIp 同类内存去重）
+    this._squatDedup = new Map();
   }
 
   // -------------------------------------------------------------------
@@ -236,10 +274,60 @@ export class AuditStore {
     const limit = type === 'admin' ? this.adminAuditLimit : this.config[type].limit;
     const arr = this.records.get(type);
     this.seq += 1;
-    arr.push({ id: this.seq, ts: Date.now(), ...ev });
+    // v1.6.0 C4：AUDIT_IP_MASK 开启时记录内 IP 打码（仅记录展示；黑名单仍完整 IP）
+    const ev2 = this.ipMask && ev && typeof ev.ip === 'string' ? { ...ev, ip: maskIp(ev.ip) } : ev;
+    arr.push({ id: this.seq, ts: Date.now(), ...ev2 });
     if (arr.length > limit) arr.splice(0, arr.length - limit);
     this._storageDirty = true;
     this._kvDirty.add('rec:' + type);
+  }
+
+  /**
+   * 摘要抢占嫌疑记录：同网络名出现不同摘要的
+   * 握手被拒事件——可能是先到者正常接入，也可能是恶意抢占（堵门）。
+   * 按「网络名|ip」10 分钟窗口去重：持续攻击至多每天每来源几条记录
+   *（免费额度零压力），其余由 room 层计数器观测。归入 digests 记录类，
+   * 受「记录设置」既有开关控制，无新 KV 键。
+   * @param {{networkName:string, digest?:string, ip?:string}} ev
+   */
+  recordSquatSuspect(ev) {
+    const key = `${ev && ev.networkName || ''}|${ev && ev.ip || ''}`;
+    const now = Date.now();
+    const last = this._squatDedup.get(key) || 0;
+    if (now - last < SQUAT_DEDUP_MS) return;
+    // 定长 FIFO：超过上限清最旧键（Map 保持插入序），防内存无界增长
+    if (this._squatDedup.size >= SQUAT_DEDUP_MAX) {
+      const first = this._squatDedup.keys().next().value;
+      this._squatDedup.delete(first);
+    }
+    this._squatDedup.set(key, now);
+    this.record('digests', { event: 'squat-suspect', ...ev });
+  }
+
+  /**
+   * 记录留存清理（v1.6.0 C4，AUDIT_RETENTION_DAYS）：按 ts 删除过期记录。
+   * 仅清理 6 类运行记录——admin 为硬审计，不受留存策略影响。
+   * 挂靠 alarm()（调用方自行节流，建议至多每小时一次）；清理后标记脏，
+   * 由下一轮 flush 同步到 DO storage 与 KV 镜像。旧记录不回填打码。
+   * @param {number} now 当前毫秒时间戳
+   * @returns {number} 删除条数（retention 关闭时返回 0）
+   */
+  pruneExpired(now = Date.now()) {
+    if (!this.retentionDays) return 0;
+    const cutoff = now - this.retentionDays * 86_400_000;
+    let removed = 0;
+    for (const type of RUNTIME_TYPES) {
+      const arr = this.records.get(type);
+      if (!Array.isArray(arr) || arr.length === 0) continue;
+      const kept = arr.filter((r) => typeof r.ts !== 'number' || r.ts >= cutoff);
+      if (kept.length !== arr.length) {
+        this.records.set(type, kept);
+        removed += arr.length - kept.length;
+        this._storageDirty = true;
+        this._kvDirty.add('rec:' + type);
+      }
+    }
+    return removed;
   }
 
   /**

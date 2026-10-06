@@ -18,7 +18,7 @@
  */
 import {
   PacketType, HeaderFlags, MAX_FORWARD_COUNTER, MAGIC, VERSION,
-  SERVER_FEATURES, LIVENESS_ECHO_FEATURE,
+  SERVER_FEATURES, LIVENESS_ECHO_FEATURE, PERSIST_BUDGET_BYTES,
 } from './constants.js';
 import { parseHeader, buildPacket, bumpForward, payloadOf } from './packet.js';
 import { PeerManager, resolveGroupKey } from './peer_manager.js';
@@ -33,6 +33,17 @@ const WS_OPEN = 1;
 const STATE_KEY = 'room_state';
 const BOOT_KEY = 'room_boot';
 const ATTACH_SYNC_INTERVAL_MS = 5000;
+
+// 账号级真实额度（v1.6.0 A6）：GraphQL Analytics API 查询结果的 DO storage 缓存
+const QUOTA_CACHE_KEY = 'quota_cache';
+const QUOTA_CACHE_MS = 5 * 60_000;   // 成功结果缓存 5 分钟（防管理页 30s 自动刷新打爆 API）
+const QUOTA_FAIL_CACHE_MS = 60_000;  // 失败结果缓存 1 分钟（避免高频重试）
+const FREE_DAILY_REQUESTS = 100_000; // Workers 免费计划每日请求额度
+
+// Analytics Engine 趋势（v1.6.0 A5/D2）：打点与查询结果的缓存
+const AE_DOT_INTERVAL_MS = 60_000;   // 每 ≥60s 一个数据点（空闲退避时随 alarm 变稀疏）
+const TRENDS_CACHE_MS = 5 * 60_000;  // AE SQL 查询结果缓存
+const TRENDS_BUCKET_SEC = { '24h': 900, '7d': 3600 }; // 24h→15min 桶（96 点）、7d→1h 桶（168 点）
 
 function str(env, key, def) {
   const v = env && env[key];
@@ -71,7 +82,7 @@ export function buildConfig(env) {
     serverPeerId: int(env, 'SERVER_PEER_ID', 10000001) >>> 0,
     serverNetworkName: str(env, 'SERVER_NETWORK_NAME', 'public_server'),
     serverHostname: str(env, 'SERVER_HOSTNAME', 'easytier-cf-relay'),
-    serverVersionStr: str(env, 'SERVER_VERSION_STR', 'easytier-cf-relay/1.5.0'),
+    serverVersionStr: str(env, 'SERVER_VERSION_STR', 'easytier-cf-relay/1.6.0'),
     avoidRelayData: bool(env, 'AVOID_RELAY_DATA', true),
     relayData: bool(env, 'RELAY_DATA', true),
     maxPeersPerRoom: int(env, 'MAX_PEERS_PER_ROOM', 64),
@@ -101,12 +112,34 @@ export function buildConfig(env) {
     routeInfoUnreachableMs: int(env, 'ROUTE_INFO_UNREACHABLE_MS', 90_000),
     // 空分组自动删除宽限（0 = 关闭）
     groupAutoDeleteMs: intOrZero(env, 'GROUP_AUTO_DELETE_MS', 60_000),
+    // ---- 资源滥用防线（语义见 constants.js；0 = 关闭该防线）----
+    // 上限自洽不变量：maxRoutesPerGroup × maxRouteInfoBytes < maxMessageBytes，
+    // 违反时构造函数日志 warn（合法全量推送可能被出站硬闸丢弃）。
+    maxSyncItems: intOrZero(env, 'MAX_SYNC_ITEMS', 256),
+    maxRouteInfoBytes: intOrZero(env, 'MAX_ROUTE_INFO_BYTES', 768),
+    maxRoutesPerGroup: intOrZero(env, 'MAX_ROUTES_PER_GROUP', 128),
+    maxDirectPeersReport: intOrZero(env, 'MAX_DIRECT_PEERS_REPORT', 64),
+    fullResyncCooldownMs: intOrZero(env, 'FULL_RESYNC_COOLDOWN_MS', 1000),
+    maxNetworkNameBytes: intOrZero(env, 'MAX_NETWORK_NAME_BYTES', 128),
     // ---- KV 审计（记录 / 黑名单）----
     recordFlushMs: int(env, 'RECORD_FLUSH_MS', 600_000),
     recordDefaultLimit: int(env, 'RECORD_DEFAULT_LIMIT', 100),
     blacklistLimit: int(env, 'BLACKLIST_LIMIT', 1000),
     adminAudit: bool(env, 'ADMIN_AUDIT', true), // 硬设置：管理端审计不可由管理页关闭
     adminAuditLimit: int(env, 'ADMIN_AUDIT_LIMIT', 200),
+    // 审计数据最小化（v1.6.0 C4）：
+    // - AUDIT_IP_MASK：记录内客户端 IP 打码（1.2.x.x / IPv6 前 4 组），
+    //   仅影响记录展示，黑名单/踢人/边缘拦截仍用完整 IP；0 = 关闭（默认）
+    auditIpMask: bool(env, 'AUDIT_IP_MASK', false),
+    // - AUDIT_RETENTION_DAYS：记录留存天数，alarm 每小时清理一次过期记录
+    //   （admin 硬审计豁免）；0 = 不限（默认）
+    auditRetentionDays: intOrZero(env, 'AUDIT_RETENTION_DAYS', 0),
+    // ---- 账号级真实额度（v1.6.0 A6，全部可选：不配置则管理页回退自观测估算）----
+    cfAccountId: str(env, 'CF_ACCOUNT_ID', ''),
+    // CF_API_TOKEN 必须 wrangler secret put（最小权限 Account Analytics: Read），
+    // 绝不写入 toml 明文、绝不下发浏览器/日志/审计
+    cfApiToken: str(env, 'CF_API_TOKEN', ''),
+    cfScriptName: str(env, 'CF_SCRIPT_NAME', 'easytier-cf-relay'),
   };
 }
 
@@ -131,6 +164,16 @@ export class RelayRoom {
     this.env = env;
     this.config = buildConfig(env);
     this.log = makeLogger(this.config.logLevel);
+    // 上限自洽检查（资源滥用防线，见 constants.js 注释）：仅提醒不阻断，
+    // 防止运维改大条目上限后合法全量推送被出站硬闸误丢
+    if (this.config.maxRoutesPerGroup > 0 && this.config.maxRouteInfoBytes > 0
+        && this.config.maxRoutesPerGroup * this.config.maxRouteInfoBytes >= this.config.maxMessageBytes) {
+      this.log.warn(
+        `cap mismatch: MAX_ROUTES_PER_GROUP(${this.config.maxRoutesPerGroup}) x ` +
+        `MAX_ROUTE_INFO_BYTES(${this.config.maxRouteInfoBytes}) >= ` +
+        `MAX_MESSAGE_BYTES(${this.config.maxMessageBytes}) — 合法全量推送可能触发出站硬闸，请调小前两者或调大 MAX_MESSAGE_BYTES`
+      );
+    }
     this.pm = new PeerManager(this.config);
     // KV 审计：记录（每类一条 KV 键）+ 黑名单（每类一条 KV 键）
     this.audit = new AuditStore({
@@ -141,6 +184,8 @@ export class RelayRoom {
       blacklistLimit: this.config.blacklistLimit,
       adminAudit: this.config.adminAudit,
       adminAuditLimit: this.config.adminAuditLimit,
+      ipMask: this.config.auditIpMask,
+      retentionDays: this.config.auditRetentionDays,
       log: this.log,
     });
     this.types = protoTypes();
@@ -156,6 +201,23 @@ export class RelayRoom {
       rateLimited: 0,
       // 分组节点上限拒绝次数（v1.5，DO 层口径）
       groupLimited: 0,
+      // ---- 资源滥用防线计数（全部为内存计数，零写入开销）----
+      // 单帧路由条目数超限整帧拒绝次数（MAX_SYNC_ITEMS，4009）
+      routeFlooded: 0,
+      // 单条条目超字节上限丢弃次数（MAX_ROUTE_INFO_BYTES）
+      routeOversized: 0,
+      // 分组条目总数超限拒绝次数（MAX_ROUTES_PER_GROUP）
+      routeCapped: 0,
+      // 出站单帧超过 MAX_MESSAGE_BYTES 丢弃次数（触发即说明状态被异常注入）
+      outboundDropped: 0,
+      // GetGlobalPeerMap 全量响应冷却拦截次数（每连接 1s 一次）
+      peerMapCooled: 0,
+      // 会话重置（强制全量重推）冷却拦截次数（每连接 1s 一次）
+      resyncCooled: 0,
+      // 摘要抢占嫌疑次数（同网络名不同摘要；记录按「网络名+IP」去重节流）
+      squatSuspect: 0,
+      // 落盘降级次数（超预算丢 raw / 裁剪条目）
+      flushDegraded: 0,
     };
     this.startedAt = Date.now();
     this._dirty = false;
@@ -199,6 +261,14 @@ export class RelayRoom {
   _onPmEvent(ev) {
     if (!ev || !ev.kind) return;
     switch (ev.kind) {
+      case 'routes-add-batch':
+        // 审计记录按帧聚合（额度保护）：单帧新增条目过多时合并为一条记录，
+        // 防洪泛帧挤爆 routes 记录环（100 条/类）——正常小帧仍逐条记录（route-add）
+        this.audit.record('routes', {
+          event: 'add-batch', groupKey: ev.groupKey, count: ev.count,
+          ...(ev.reporter != null ? { reporter: ev.reporter } : {}),
+        });
+        break;
       case 'route-add':
         this.audit.record('routes', {
           event: 'add', groupKey: ev.groupKey, peerId: ev.peerId,
@@ -259,6 +329,14 @@ export class RelayRoom {
 
     if (path === '/internal/stats') {
       return Response.json(this._stats());
+    }
+    // 账号级真实额度（v1.6.0 A6）：仅由管理端 Worker 鉴权后转发调用
+    if (path === '/internal/quota' && request.method === 'GET') {
+      return this._handleQuota();
+    }
+    // AE 趋势（v1.6.0 A5/D2）：?window=24h|7d
+    if (path === '/internal/trends' && request.method === 'GET') {
+      return this._handleTrends(url);
     }
     // 以下管理端内部端点仅由 Worker 入口在鉴权后转发调用（DO 无外部直达路径）。
     // x-admin-ip 为管理员来源 IP（Worker 入口注入），用于管理端审计（登录/操作）。
@@ -465,6 +543,9 @@ export class RelayRoom {
     ws._handshakedAt = meta.handshakedAt ?? null;
     ws._lastAttachSync = now;
     ws._serverPingSent = false;
+    // 冷却戳随 attachment 恢复（休眠唤醒后防线不失效）
+    ws._lastFullPeerMapAt = Number(meta.lastFullPeerMapAt) || 0;
+    ws._lastSessionResetAt = Number(meta.lastSessionResetAt) || 0;
 
     // 重新注册到分组（未完成握手的 socket 不注册，等待握手或超时清理）
     if (ws._peerId != null && ws._groupKey) {
@@ -485,6 +566,10 @@ export class RelayRoom {
         connectedAt: ws._connectedAt ?? Date.now(),
         handshakedAt: ws._handshakedAt ?? null,
         lastSeen: lastSeenOverride ?? ws._lastSeen ?? Date.now(),
+        // 资源滥用防线的每连接冷却戳：随 attachment 持久化，
+        // 休眠唤醒后冷却仍然有效（内存戳会随 DO 重启丢失）
+        lastFullPeerMapAt: ws._lastFullPeerMapAt ?? 0,
+        lastSessionResetAt: ws._lastSessionResetAt ?? 0,
       });
     } catch {
       // attachment 不可用时忽略（极端运行时）
@@ -601,7 +686,10 @@ export class RelayRoom {
       }
     }
 
-    const payload = payloadOf(buf);
+    // 按 header.len 截断——官方语义 len = payload 长度，
+    // len < 实际负载的部分视为填充；本地解析不再吞入填充字节。
+    // 转发路径（_forward）仍逐字节搬运原帧，透传行为不变。
+    const payload = payloadOf(buf, header.len);
     this.log.debug(
       `msg type=${header.packetType} from=${header.fromPeerId} to=${header.toPeerId} ` +
       `flags=${header.flags} len=${buf.length}`
@@ -707,6 +795,17 @@ export class RelayRoom {
     const networkName = String(req.networkName || '');
     const digestHex = bytesToHex(req.networkSecretDigest || new Uint8Array(0));
 
+    // 空网络名 / 超长网络名拒绝：空名会生成退化
+    // 分组 ":<digest>"；超长名直接进 groupKey 并持久化。官方客户端恒带
+    // 非空、短于 DNS 域名长度上限的网络名，不影响兼容。
+    if (!networkName || networkName.length > this.config.maxNetworkNameBytes) {
+      this.log.warn(
+        `handshake rejected: bad network name (len=${networkName.length}) peer=${peerId}`
+      );
+      this._close(ws, 4002, 'bad network name');
+      return;
+    }
+
     // 黑名单拦截：peerId / 网络名（group / digest 两类；digest 类 v1.4.2 起
     // 支持完整「网络名:摘要」粒度）
     {
@@ -731,6 +830,16 @@ export class RelayRoom {
       this.log.warn(
         `handshake rejected: digest mismatch network="${networkName}" peer=${peerId}`
       );
+      // 抢占嫌疑：注册表已有该网络名的不同摘要——可能是
+      // 先到者正常接入，也可能是恶意抢占（错误密钥堵门锁死网络名）。按
+      // 「网络名+IP」去重节流记录（持续攻击至多每天几条，免费额度零压力），
+      // 其余只进内存计数；管理员在摘要注册记录页可见攻击源并拉黑。
+      this.counters.squatSuspect += 1;
+      this.audit.recordSquatSuspect({
+        networkName,
+        digest: digestHex.slice(0, 16),
+        ...(ws._clientIp ? { ip: ws._clientIp } : {}),
+      });
       this._close(ws, 4003, 'digest mismatch');
       return;
     }
@@ -762,26 +871,32 @@ export class RelayRoom {
       }
     }
 
-    // 注册
+    // 注册。顶替（同 peerId 重连）必须【先清理旧连接、再注册新连接】——
+    // 同 peerId 后清会把【新连接】的注册一并删掉（removePeer 按 peerId 匹配）：
+    // 顶替者/重连者成为「能发包、收不到包」的幽灵连接，房间容量计数被洗掉。
+    // 先清后注复用既有单连接清理路径（removePeer：清条目/会话/广播/版本号），
+    // 新连接注册后状态干净。
     ws._peerId = peerId;
     ws._groupKey = groupKey;
     ws._networkName = networkName;
     ws._domainName = networkName;
     ws._handshakedAt = Date.now();
-    const replaced = this.pm.addPeer(groupKey, peerId, ws);
-    if (replaced) {
+    const prior = this.pm.getPeer(groupKey, peerId);
+    const isReplace = !!(prior && prior !== ws);
+    if (isReplace) {
       this.log.info(`peer=${peerId} reconnected, closing stale socket`);
       try {
-        replaced.close(4000, 'replaced');
+        prior.close(4000, 'replaced');
       } catch { /* ignore */ }
-      this._cleanupPeer(replaced, 'replaced');
+      this._cleanupPeer(prior, 'replaced');
     }
+    this.pm.addPeer(groupKey, peerId, ws);
     this._saveAttachment(ws);
     this._markDirty();
 
     // 审计记录：节点加入 / 分组创建 / 摘要注册
     this.audit.record('peers', {
-      event: replaced ? 'replace' : 'join', groupKey, networkName, peerId,
+      event: isReplace ? 'replace' : 'join', groupKey, networkName, peerId,
       ...(ws._clientIp ? { ip: ws._clientIp } : {}),
     });
     if (!groupExisted) {
@@ -862,6 +977,17 @@ export class RelayRoom {
 
   _send(ws, bytes) {
     if (!ws || ws.readyState !== WS_OPEN) return;
+    // 出站硬闸：入站有 MAX_MESSAGE_BYTES，出站同样收口。正常路由推送受
+    // 「分组条目上限 × 单条字节上限 < 本上限」自洽不变量保护（128×768B=96KB），
+    // 永不触发本闸；触发即说明状态被异常注入，丢弃并计数（不关闭连接：
+    // 毒状态由分组条目上限与老化负责清除）。
+    if (bytes.length > this.config.maxMessageBytes) {
+      this.counters.outboundDropped += 1;
+      this.log.warn(
+        `outbound frame dropped: ${bytes.length} > ${this.config.maxMessageBytes} (peer=${ws._peerId})`
+      );
+      return;
+    }
     try {
       ws.send(bytes);
       this.counters.msgsOut += 1;
@@ -941,9 +1067,21 @@ export class RelayRoom {
       pm: this.pm,
       config: this.config,
       log: this.log,
+      counters: this.counters,
       send: (ws, bytes) => this._send(ws, bytes),
       pushRoute: (ws, forceFull) => this._pushRoute(ws, forceFull),
       broadcast: (groupKey, excludePeerId) => this._broadcast(groupKey, excludePeerId),
+      close: (ws, code, reason) => this._close(ws, code, reason),
+      // 冷却戳写入后由 RPC 层立即持久化（防休眠重启丢失）
+      saveAttachment: (ws) => this._saveAttachment(ws),
+      // 冷却戳读取：内存优先，缺失（跨隔离体/休眠唤醒）时回落 attachment——
+      // 保证冷却判定与实例调度方式无关（确定性防线）
+      getStamp: (ws, key) => {
+        const v = ws[key];
+        if (typeof v === 'number' && v > 0) return v;
+        const meta = this._loadAttachment(ws);
+        return Number(meta && meta[key]) || 0;
+      },
     };
   }
 
@@ -956,6 +1094,7 @@ export class RelayRoom {
     const now = Date.now();
     const cfg = this.config;
     this.counters.alarmCount = (this.counters.alarmCount || 0) + 1; // v1.5 额度估算用
+    this._maybeWriteDot(now); // v1.6 A5：AE 趋势打点（≥60s 一次，未绑定 AE 静默跳过）
 
     for (const ws of this.state.getWebSockets()) {
       if (ws.readyState !== WS_OPEN) continue;
@@ -1007,6 +1146,13 @@ export class RelayRoom {
     // 持久化（脏数据节流，至少间隔 30s；立即场景由 _markDirty+短 alarm 处理）
     if (this._dirty && now - this._storageFlushAt >= 30_000) {
       await this._flushState();
+    }
+
+    // 留存清理（v1.6.0 C4）：至多每小时一次，按 AUDIT_RETENTION_DAYS 删过期记录
+    if (cfg.auditRetentionDays > 0 && now - (this._lastPruneAt || 0) >= 3_600_000) {
+      this._lastPruneAt = now;
+      const pruned = this.audit.pruneExpired(now);
+      if (pruned > 0) this.log.info(`audit retention pruned ${pruned} records (> ${cfg.auditRetentionDays}d)`);
     }
 
     // KV 审计刷盘：DO storage 脏即写；KV 镜像按 RECORD_FLUSH_MS 节流
@@ -1075,8 +1221,26 @@ export class RelayRoom {
   async _flushState() {
     this._storageFlushAt = Date.now();
     this._dirty = false;
+    // 落盘预算降级：DO storage 单值上限 128 KiB。raw 字节
+    // 以 JSON 数字数组持久化（4-5× 膨胀），被注入的巨型状态曾估算可超限——
+    // 超限后每次 flush 白写（浪费存储写入）、重启丢状态。失败即降级重试
+    //（正常网络永不触发、零额外开销）：全量 → 丢 raw（退对象路径）→ 裁剪最老条目。
     try {
-      await this.state.storage.put(STATE_KEY, this.pm.toPersisted());
+      try {
+        await this.state.storage.put(STATE_KEY, this.pm.toPersisted());
+        return;
+      } catch (e1) {
+        this.counters.flushDegraded += 1;
+        this.log.warn(`flush state over budget, retrying without raw bytes: ${e1.message}`);
+      }
+      try {
+        await this.state.storage.put(STATE_KEY, this.pm.toPersisted({ dropRaw: true }));
+        return;
+      } catch (e2) {
+        this.counters.flushDegraded += 1;
+        this.log.warn(`flush state still over budget, trimming oldest entries: ${e2.message}`);
+      }
+      await this.state.storage.put(STATE_KEY, this.pm.toPersisted({ dropRaw: true, trimEntries: 16 }));
     } catch (e) {
       this.log.warn(`flush state failed: ${e.message}`);
     }
@@ -1174,6 +1338,12 @@ export class RelayRoom {
         routeInfoTtlMs: this.config.routeInfoTtlMs,
         routeInfoUnreachableMs: this.config.routeInfoUnreachableMs,
         groupAutoDeleteMs: this.config.groupAutoDeleteMs,
+        // 资源滥用防线
+        maxSyncItems: this.config.maxSyncItems,
+        maxRouteInfoBytes: this.config.maxRouteInfoBytes,
+        maxRoutesPerGroup: this.config.maxRoutesPerGroup,
+        maxDirectPeersReport: this.config.maxDirectPeersReport,
+        fullResyncCooldownMs: this.config.fullResyncCooldownMs,
       },
     };
   }
@@ -1393,6 +1563,13 @@ export class RelayRoom {
         knownInfos: g.infos.size,
       };
     }
+    // 连接列表统计（v1.6.0 补齐：此前 JSON 只含 peers/groups 总数）
+    let socketsTotal = 0;
+    let socketsHandshaked = 0;
+    for (const ws of this.state.getWebSockets()) {
+      socketsTotal += 1;
+      if (ws._peerId != null) socketsHandshaked += 1;
+    }
     return {
       ok: true,
       startedAt: this.startedAt,
@@ -1402,14 +1579,315 @@ export class RelayRoom {
       groupCount: this.pm.groupCount(),
       groups,
       counters: this.counters,
+      sockets: { total: socketsTotal, handshaked: socketsHandshaked, pending: socketsTotal - socketsHandshaked },
+      audit: {
+        kvEnabled: !!this.audit.kv,
+        records: this.audit._counts(),
+        blacklist: this.audit.blacklistCounts(),
+      },
+      // v1.6.0：config 对齐管理端白名单（此前仅 6 项，落后多个版本）
       config: {
+        serverHostname: this.config.serverHostname,
+        serverVersionStr: this.config.serverVersionStr,
+        serverNetworkName: this.config.serverNetworkName,
         avoidRelayData: this.config.avoidRelayData,
         relayData: this.config.relayData,
         strictDigest: this.config.strictDigest,
         maxPeersPerRoom: this.config.maxPeersPerRoom,
+        maxPeersPerGroup: this.config.maxPeersPerGroup,
+        maxConnsPerIp: this.config.maxConnsPerIp,
+        maxMessageBytes: this.config.maxMessageBytes,
+        msgRateLimitPerSec: this.config.msgRateLimitPerSec,
+        handshakeTimeoutMs: this.config.handshakeTimeoutMs,
         peerIdleTimeoutMs: this.config.peerIdleTimeoutMs,
+        serverPingIdleMs: this.config.serverPingIdleMs,
+        sweepIntervalMs: this.config.sweepIntervalMs,
+        sweepIdleIntervalMs: this.config.sweepIdleIntervalMs,
         digestValidation: !!this.config.networkSecrets,
+        routeInfoTtlMs: this.config.routeInfoTtlMs,
+        routeInfoUnreachableMs: this.config.routeInfoUnreachableMs,
+        groupAutoDeleteMs: this.config.groupAutoDeleteMs,
+        // 资源滥用防线
+        maxSyncItems: this.config.maxSyncItems,
+        maxRouteInfoBytes: this.config.maxRouteInfoBytes,
+        maxRoutesPerGroup: this.config.maxRoutesPerGroup,
+        maxDirectPeersReport: this.config.maxDirectPeersReport,
+        fullResyncCooldownMs: this.config.fullResyncCooldownMs,
       },
     };
   }
+
+  // -------------------------------------------------------------------
+  // 账号级真实额度（v1.6.0 A6）
+  // -------------------------------------------------------------------
+
+  /**
+   * 额度查询（恒 200，响应恒带 ok:true —— 管理端统一门禁字段，与 /internal/trends
+   * 同约定；前端按 source 渲染三态）：
+   * - unconfigured：未配置 CF_ACCOUNT_ID/CF_API_TOKEN（零配置行为不变）；
+   * - cloudflare：真实数据（DO storage 缓存 5 分钟，失败缓存 1 分钟）；
+   * - unavailable：查询失败（凭证失效/API 变更等），管理页回退估算。
+   * 响应体绝不包含 CF_API_TOKEN（仅聚合计数）。
+   */
+  async _handleQuota() {
+    const account = this.config.cfAccountId;
+    const token = this.config.cfApiToken;
+    if (!account || !token) {
+      return Response.json({ ok: true, source: 'unconfigured', dailyQuota: FREE_DAILY_REQUESTS });
+    }
+    const now = Date.now();
+    try {
+      const cached = await this.state.storage.get(QUOTA_CACHE_KEY);
+      if (cached && typeof cached.fetchedAt === 'number') {
+        const ttl = cached.source === 'cloudflare' ? QUOTA_CACHE_MS : QUOTA_FAIL_CACHE_MS;
+        if (now - cached.fetchedAt < ttl) {
+          return Response.json({ ok: true, ...cached, cached: true });
+        }
+      }
+    } catch { /* 缓存读失败 → 直接查询 */ }
+    const result = await this._fetchQuota(account, token, now);
+    try {
+      await this.state.storage.put(QUOTA_CACHE_KEY, result);
+    } catch { /* 缓存写失败不影响返回 */ }
+    return Response.json({ ok: true, ...result, cached: false });
+  }
+
+  /** 出站调 Cloudflare GraphQL Analytics API（出站调用不消耗 100k 入站请求额度） */
+  async _fetchQuota(account, token, now) {
+    const untilDate = new Date(now);
+    // 统计窗口：当日 UTC 0 点 → 现在（免费计划额度每日 UTC 0 点重置 = 北京 8 点）
+    const since = new Date(Date.UTC(
+      untilDate.getUTCFullYear(), untilDate.getUTCMonth(), untilDate.getUTCDate()
+    ));
+    // 按小时桶取数（一天至多 24 行）后跨行求和：行数受控，limit 截断不再低估当日请求数；
+    // datetime_leq 为官方 schema 拼写（geq/leq 一对）
+    const query = `query($account: String!, $script: String!, $since: Time!, $until: Time!) {
+      viewer { accounts(filter: { accountTag: $account }) {
+        workersInvocationsAdaptive(
+          limit: 1000,
+          filter: { scriptName: $script, datetime_geq: $since, datetime_leq: $until },
+          orderBy: [datetimeHour_ASC]
+        ) { dimensions { datetimeHour } sum { requests subrequests errors } }
+      } }
+    }`;
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 5000);
+    try {
+      const res = await fetch('https://api.cloudflare.com/client/v4/graphql', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+        body: JSON.stringify({
+          query,
+          variables: {
+            account,
+            script: this.config.cfScriptName,
+            since: since.toISOString(),
+            until: untilDate.toISOString(),
+          },
+        }),
+        signal: ctrl.signal,
+      });
+      const j = await res.json();
+      if (!res.ok || (j.errors && j.errors.length)) {
+        const msg = (j.errors && j.errors[0] && j.errors[0].message) || `HTTP ${res.status}`;
+        return { source: 'unavailable', error: String(msg).slice(0, 200), fetchedAt: now };
+      }
+      const rows = j && j.data && j.data.viewer && j.data.viewer.accounts
+        && j.data.viewer.accounts[0] && j.data.viewer.accounts[0].workersInvocationsAdaptive;
+      if (!Array.isArray(rows)) {
+        return { source: 'unavailable', error: 'unexpected graphql shape', fetchedAt: now };
+      }
+      let requests = 0; let subrequests = 0; let errors = 0;
+      for (const row of rows) {
+        const s = (row && row.sum) || {};
+        requests += Number(s.requests) || 0;
+        subrequests += Number(s.subrequests) || 0;
+        errors += Number(s.errors) || 0;
+      }
+      return {
+        source: 'cloudflare',
+        requests, subrequests, errors,
+        sinceIso: since.toISOString(),
+        untilIso: untilDate.toISOString(),
+        scriptName: this.config.cfScriptName,
+        fetchedAt: now,
+      };
+    } catch (e) {
+      return { source: 'unavailable', error: String((e && e.message) || e).slice(0, 200), fetchedAt: now };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  // -------------------------------------------------------------------
+  // Analytics Engine 趋势打点与查询（v1.6.0 A5/D2）
+  // -------------------------------------------------------------------
+
+  /**
+   * alarm 周期打点：每 ≥60s 一个数据点（空闲退避时随 alarm 间隔自然变稀疏）。
+   * 列映射（后续 AE SQL 按列号引用，勿调换顺序）：
+   *   double1 在线节点数 | double2 分组数 | double3 收包累计 | double4 发包累计
+   *   double5 流量累计(字节) | double6 累计连接 | double7 协议错误 | double8 alarm 累计
+   * blob1 服务端版本（低基数）。计数器随 DO 重启归零属预期（趋势按增量/钳零展示）。
+   * 未绑定 AE（env.AE 缺失）时静默跳过——零配置行为不变。
+   */
+  _maybeWriteDot(now) {
+    const ae = this.env && this.env.AE;
+    if (!ae || typeof ae.writeDataPoint !== 'function') return;
+    if (now - (this._lastDotAt || 0) < AE_DOT_INTERVAL_MS) return;
+    this._lastDotAt = now;
+    try {
+      ae.writeDataPoint({
+        indexes: ['relay'],
+        blobs: [this.config.serverVersionStr || ''],
+        doubles: [
+          this.pm.totalPeers(),
+          this.pm.groupCount(),
+          this.counters.msgsIn || 0,
+          this.counters.msgsOut || 0,
+          (this.counters.bytesIn || 0) + (this.counters.bytesOut || 0),
+          this.counters.connsTotal || 0,
+          this.counters.errors || 0,
+          this.counters.alarmCount || 0,
+        ],
+      });
+    } catch (e) {
+      this.log.warn(`ae writeDataPoint failed: ${e && e.message || e}`);
+    }
+  }
+
+  /**
+   * 趋势查询（恒 200，前端按 source 渲染）：
+   * - unconfigured：未绑定 AE 或未配 CF 凭证（reason: ae_not_bound / credentials_missing）；
+   * - ae：返回分桶点列 [{t, peers, msgsPerMin}]。
+   * 首选 SQL 服务端分桶（intDiv/toUInt32）；该查询失败时回退原始点查询 +
+   * 服务端 JS 聚合（AE SQL 方言未文档化全部函数，防御式兼容）。
+   * 结果缓存 5 分钟（防 30s 自动刷新打爆 SQL API）。
+   */
+  async _handleTrends(url) {
+    const ae = this.env && this.env.AE;
+    const account = this.config.cfAccountId;
+    const token = this.config.cfApiToken;
+    if (!ae || !account || !token) {
+      return Response.json({
+        ok: true, source: 'unconfigured',
+        reason: !ae ? 'ae_not_bound' : 'credentials_missing',
+      });
+    }
+    const window = url.searchParams.get('window') === '7d' ? '7d' : '24h';
+    const now = Date.now();
+    const cacheKey = 'trends_cache_' + window;
+    try {
+      const cached = await this.state.storage.get(cacheKey);
+      if (cached && typeof cached.fetchedAt === 'number' && now - cached.fetchedAt < TRENDS_CACHE_MS) {
+        return Response.json({ ...cached, cached: true });
+      }
+    } catch { /* 缓存读失败 → 直接查询 */ }
+    const hours = window === '7d' ? 168 : 24;
+    const bucketSec = TRENDS_BUCKET_SEC[window];
+    let result;
+    try {
+      result = await this._trendsSqlBuckets(account, token, hours, bucketSec, now);
+    } catch (e) {
+      // SQL 分桶查询失败（方言差异/超时等）→ 回退原始点 JS 聚合
+      try {
+        result = await this._trendsRawFallback(account, token, hours, bucketSec, now);
+      } catch (e2) {
+        result = { source: 'unavailable', error: String((e2 && e2.message) || e2).slice(0, 200), fetchedAt: now };
+      }
+    }
+    const payload = { ok: true, window, bucketSec, ...result };
+    try {
+      await this.state.storage.put(cacheKey, payload);
+    } catch { /* 缓存写失败不影响返回 */ }
+    return Response.json(payload);
+  }
+
+  /** AE SQL API 端点 */
+  _aeSqlUrl(account) {
+    return `https://api.cloudflare.com/client/v4/accounts/${account}/analytics_engine/sql`;
+  }
+
+  /**
+   * SQL 服务端分桶查询：返回 {source:'ae', points, fetchedAt} 或抛错。
+   * msgsPerMin = 桶内收包累计增量 / 桶长分钟（DO 重启导致负增量钳为 0）。
+   */
+  async _trendsSqlBuckets(account, token, hours, bucketSec, now) {
+    const sql = `SELECT intDiv(toUInt32(timestamp), ${bucketSec}) * ${bucketSec} AS bucket, `
+      + `avg(double1) AS peers, min(double3) AS mi0, max(double3) AS mi1 `
+      + `FROM easytier_relay WHERE timestamp > NOW() - INTERVAL '${hours}' HOUR `
+      + `GROUP BY bucket ORDER BY bucket ASC`;
+    const rows = await this._aeSqlQuery(account, token, sql);
+    const points = [];
+    const bucketMs = bucketSec * 1000;
+    for (const r of rows) {
+      const t = (Number(r[0]) || 0) * 1000;
+      const peers = Number(r[1]) || 0;
+      const delta = Math.max(0, (Number(r[3]) || 0) - (Number(r[2]) || 0));
+      points.push({ t, peers: Math.round(peers * 10) / 10, msgsPerMin: Math.round(delta / (bucketMs / 60000)) });
+    }
+    return { source: 'ae', points, fetchedAt: now };
+  }
+
+  /** 回退：原始点查询（≤LIMIT 10000）+ 服务端 JS 分桶聚合 */
+  async _trendsRawFallback(account, token, hours, bucketSec, now) {
+    const sql = `SELECT timestamp, double1, double3 FROM easytier_relay `
+      + `WHERE timestamp > NOW() - INTERVAL '${hours}' HOUR `
+      + `ORDER BY timestamp ASC LIMIT 10000`;
+    const rows = await this._aeSqlQuery(account, token, sql);
+    const buckets = new Map(); // bucketStartMs -> {peerSum, n, mi0, mi1}
+    for (const r of rows) {
+      const t = parseAeTimestamp(r[0]);
+      if (!Number.isFinite(t)) continue;
+      const b = Math.floor(t / (bucketSec * 1000)) * bucketSec * 1000;
+      const cur = buckets.get(b) || { peerSum: 0, n: 0, mi0: Infinity, mi1: -Infinity };
+      const peers = Number(r[1]) || 0;
+      const mi = Number(r[2]) || 0;
+      cur.peerSum += peers; cur.n += 1;
+      cur.mi0 = Math.min(cur.mi0, mi);
+      cur.mi1 = Math.max(cur.mi1, mi);
+      buckets.set(b, cur);
+    }
+    const points = [];
+    for (const [t, cur] of buckets) {
+      const delta = Math.max(0, cur.mi1 - cur.mi0);
+      points.push({
+        t,
+        peers: Math.round((cur.peerSum / Math.max(1, cur.n)) * 10) / 10,
+        msgsPerMin: Math.round(delta / (bucketSec / 60)),
+      });
+    }
+    points.sort((a, b) => a.t - b.t);
+    return { source: 'ae', points, fetchedAt: now, fallback: true };
+  }
+
+  /** 执行 AE SQL 查询并解析 CSV 响应（SQL API 返回 text/csv，首行为表头） */
+  async _aeSqlQuery(account, token, sql) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 8000);
+    try {
+      const res = await fetch(this._aeSqlUrl(account), {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'content-type': 'text/plain' },
+        body: sql,
+        signal: ctrl.signal,
+      });
+      if (!res.ok) throw new Error(`ae sql HTTP ${res.status}`);
+      const text = await res.text();
+      const lines = text.trim().split('\n');
+      if (lines.length < 2) return []; // 仅表头 → 无数据
+      return lines.slice(1).map((l) => l.split(','));
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+}
+
+/** AE SQL timestamp 解析：unix 秒数字串或 "YYYY-MM-DD HH:MM:SS"（UTC） */
+export function parseAeTimestamp(s) {
+  const v = String(s ?? '').trim();
+  if (/^\d+$/.test(v)) return Number(v) * 1000;
+  const m = v.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})/);
+  if (!m) return NaN;
+  return Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]);
 }

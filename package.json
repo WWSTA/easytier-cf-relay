@@ -1,6 +1,6 @@
 {
   "name": "easytier-cf-relay",
-  "version": "1.5.0",
+  "version": "1.6.0",
   "description": "EasyTier WebSocket relay on Cloudflare Workers + Durable Objects (pure P2P preferred, hibernation-friendly)",
   "main": "src/index.js",
   "type": "module",

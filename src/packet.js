@@ -82,7 +82,15 @@ export function bumpForward(fullMessage, maxForwardCounter) {
   return out;
 }
 
-/** 提取 payload 视图（不拷贝） */
-export function payloadOf(buf) {
-  return buf.subarray(HEADER_SIZE);
+/**
+ * 提取 payload 视图（不拷贝）。
+ * len 传入 header.len 时按官方语义截断：len < 实际负载的
+ * 部分视为填充，本地解析不再吞入填充字节；len 缺省或 >= 负载长度时行为不变。
+ * 转发路径仍搬运完整原帧，透传不受影响。
+ */
+export function payloadOf(buf, len = null) {
+  if (len == null || len < 0 || buf.length - HEADER_SIZE <= len) {
+    return buf.subarray(HEADER_SIZE);
+  }
+  return buf.subarray(HEADER_SIZE, HEADER_SIZE + len);
 }

@@ -15,7 +15,7 @@
  * - SyncRouteInfoRequest 出站走 wire 层重组（wire.js），逐字节保留对端上报的
  *   RoutePeerInfo 原始内容（对齐官方 route_peer_wire.rs raw_peer_infos 机制）。
  */
-import { PacketType, CompressionAlgo, RpcProtoName } from './constants.js';
+import { PacketType, CompressionAlgo, RpcProtoName, MAX_SYNC_ITEMS, MAX_DIRECT_PEERS_REPORT, FULL_RESYNC_COOLDOWN_MS } from './constants.js';
 import {
   protoTypes, toU64Long, randomU64Long, longToString,
 } from './proto.js';
@@ -246,25 +246,74 @@ async function handleSyncRouteInfo(ctx, ws, header, rpcPacket, innerBody) {
   // 提取原始 RoutePeerInfo 字节（未知字段保留），与解码后的 items 一一对应
   const rawItems = extractRawPeerInfos(innerBody);
 
+  // 资源滥用防线：单帧条目数上限。默认 256 = 默认房间 64 peer 的 4× 余量，
+  // 超出整帧拒绝（close 4009，与入站超大消息同类语义）。
+  const items = (req.peerInfos && req.peerInfos.items) || [];
+  const maxSyncItems = ctx.config.maxSyncItems ?? MAX_SYNC_ITEMS;
+  if (maxSyncItems > 0 && items.length > maxSyncItems) {
+    if (ctx.counters) ctx.counters.routeFlooded = (ctx.counters.routeFlooded || 0) + 1;
+    ctx.log.warn(
+      `route flood guard: ${items.length} items > ${maxSyncItems} from=${fromPeerId}, closing (4009)`
+    );
+    if (ctx.close) ctx.close(ws, 4009, 'route flood');
+    return;
+  }
+
   // 合并对端上报的 peer 信息。
   // 加固：条目 peerId === 上报者本人 -> direct（可信自报）；
   // 其余为 transit（他报），PeerManager 会拒绝其覆盖 direct 条目（防路由投毒）。
+  // 批量路径：bump / emit 由本函数在循环后每帧一次（逐条 bump 为 O(n²)），
+  // 审计记录按帧聚合（单帧新增超阈值合并为一条，防洪泛挤爆 routes 记录环）。
   let hasNew = false;
-  const items = (req.peerInfos && req.peerInfos.items) || [];
+  const newEntries = [];
+  let oversized = 0;
+  let capped = 0;
+  const ROUTE_ADD_AGGREGATE_THRESHOLD = 16;
   for (let i = 0; i < items.length; i++) {
     const info = items[i];
     if (typeof info.peerId === 'number') {
       const source = info.peerId === fromPeerId ? 'direct' : 'transit';
       // 幽灵防线：reporterPid 让 PeerManager 追踪 transit 条目来源，
       // 上报者断开后其上报的无主条目立即清除
-      const r = pm.updatePeerInfo(groupKey, info, rawItems ? rawItems[i] : null, source, fromPeerId);
-      if (r.isNew) hasNew = true;
-      if (r.rejected) {
+      const r = pm.updatePeerInfo(groupKey, info, rawItems ? rawItems[i] : null, source, fromPeerId,
+        { deferBump: true, deferEmit: true });
+      if (r.isNew) {
+        hasNew = true;
+        newEntries.push({ peerId: info.peerId, source });
+      }
+      if (r.oversized) {
+        oversized += 1;
+        if (ctx.counters) ctx.counters.routeOversized = (ctx.counters.routeOversized || 0) + 1;
+      } else if (r.capped) {
+        capped += 1;
+        if (ctx.counters) ctx.counters.routeCapped = (ctx.counters.routeCapped || 0) + 1;
+      } else if (r.rejected) {
         ctx.log.warn(
           `drop transit route info for peer=${info.peerId} (owned by connected peer), from=${fromPeerId}`
         );
       }
     }
+  }
+  if (hasNew) pm.bumpAllConnVersions(groupKey);
+  if (newEntries.length > ROUTE_ADD_AGGREGATE_THRESHOLD) {
+    pm._emit({
+      kind: 'routes-add-batch', groupKey, count: newEntries.length, reporter: fromPeerId,
+      direct: newEntries.filter((e) => e.source === 'direct').length,
+    });
+  } else {
+    for (const e of newEntries) {
+      pm._emit({ kind: 'route-add', groupKey, peerId: e.peerId, source: e.source });
+    }
+  }
+  if (oversized > 0) {
+    ctx.log.warn(
+      `drop ${oversized} oversized route info entries (> ${ctx.config.maxRouteInfoBytes ?? 768}B) from=${fromPeerId}`
+    );
+  }
+  if (capped > 0) {
+    ctx.log.warn(
+      `drop ${capped} route info entries: group at route cap (${ctx.config.maxRoutesPerGroup}) from=${fromPeerId}`
+    );
   }
 
   // 响应 SyncRouteInfoResponse
@@ -312,12 +361,26 @@ async function handleReportPeers(ctx, ws, header, rpcPacket, innerBody) {
       `ReportPeers my_peer_id=${req.myPeerId} != conn peer=${reporter}, overriding`
     );
   }
+  // directPeers 条目上限：GetGlobalPeerMap 响应体积 = Σ 各上报者直连表，
+  // 单上报者截断到上限（官方语义：合法节点的 P2P 邻居通常仅数十个），
+  // 配合全量响应冷却共同给该端点的响应体积与频率封顶。
   const directPeers = {};
   const src = (req.peerInfos && req.peerInfos.directPeers) || {};
+  const capDirect = ctx.config.maxDirectPeersReport ?? MAX_DIRECT_PEERS_REPORT;
+  let truncated = 0;
   for (const [pid, info] of Object.entries(src)) {
+    if (capDirect > 0 && Object.keys(directPeers).length >= capDirect) {
+      truncated = Object.keys(src).length - capDirect;
+      break;
+    }
     directPeers[String(pid)] = {
       ...(info && typeof info.latencyMs === 'number' ? { latencyMs: info.latencyMs } : {}),
     };
+  }
+  if (truncated > 0) {
+    ctx.log.warn(
+      `ReportPeers directPeers truncated (${truncated} entries > cap=${capDirect}) from=${reporter}`
+    );
   }
   ctx.pm.reportPeers(ws._groupKey, reporter, { directPeers });
   const resp = buildRpcResponse({
@@ -330,7 +393,12 @@ async function handleReportPeers(ctx, ws, header, rpcPacket, innerBody) {
 }
 
 /**
- * 处理 PeerCenterRpc.GetGlobalPeerMap (method 1)。带摘要缓存。
+ * 处理 PeerCenterRpc.GetGlobalPeerMap (method 1)。
+ * 摘要脏标缓存 + 每连接全量响应冷却：
+ * - 缓存命中（未脏且客户端摘要与服务端一致）直接回空，不再重建快照/重算
+ *   SHA-256；
+ * - 全量响应（客户端 digest=0 或摘要不匹配）每连接 ≥1s 一次，冷却期请求
+ *   静默丢弃。官方客户端仅在启动与表变化后请求全量，冷却无感。
  */
 async function handleGetGlobalPeerMap(ctx, ws, header, rpcPacket, innerBody) {
   const types = protoTypes();
@@ -343,11 +411,23 @@ async function handleGetGlobalPeerMap(ctx, ws, header, rpcPacket, innerBody) {
   }
   const groupKey = ws._groupKey;
   const pc = ctx.pm.getPeerCenter(groupKey);
-  const snapshot = ctx.pm.buildGlobalPeerMapSnapshot(groupKey);
-  const digest = await computePeerCenterDigest(snapshot);
+  const clientDigest = longToString(req.digest);
+  const cacheHit = !pc.dirty && clientDigest !== '0' && clientDigest === pc.digest;
+  const now = Date.now();
+  if (!cacheHit) {
+    const cooldown = ctx.config.fullResyncCooldownMs ?? FULL_RESYNC_COOLDOWN_MS;
+    const lastFull = ctx.getStamp ? ctx.getStamp(ws, '_lastFullPeerMapAt') : (ws._lastFullPeerMapAt || 0);
+    if (cooldown > 0 && now - lastFull < cooldown) {
+      if (ctx.counters) ctx.counters.peerMapCooled = (ctx.counters.peerMapCooled || 0) + 1;
+      ctx.log.debug(`GetGlobalPeerMap full response cooled down from=${header.fromPeerId}`);
+      return;
+    }
+    ws._lastFullPeerMapAt = now;
+    if (ctx.saveAttachment) ctx.saveAttachment(ws); // 戳随 attachment 持久化（防休眠重启丢失）
+  }
 
   // 摘要相同：回空响应（客户端保留本地缓存）
-  if (pc.digest === digest && longToString(req.digest) !== '0') {
+  if (cacheHit) {
     const resp = buildRpcResponse({
       fromPeer: ctx.config.serverPeerId,
       toPeer: header.fromPeerId,
@@ -358,7 +438,18 @@ async function handleGetGlobalPeerMap(ctx, ws, header, rpcPacket, innerBody) {
     return;
   }
 
-  pc.digest = digest;
+  let digest;
+  let snapshot;
+  if (pc.dirty) {
+    snapshot = ctx.pm.buildGlobalPeerMapSnapshot(groupKey);
+    digest = await computePeerCenterDigest(snapshot);
+    pc.digest = digest;
+    pc.dirty = false;
+  } else {
+    // 未脏：复用缓存摘要，快照浅拷贝仅用于编码
+    snapshot = ctx.pm.buildGlobalPeerMapSnapshot(groupKey);
+    digest = pc.digest;
+  }
   const resp = buildRpcResponse({
     fromPeer: ctx.config.serverPeerId,
     toPeer: header.fromPeerId,
@@ -395,6 +486,23 @@ export function handleRpcResponse(ctx, ws, header, payload) {
   try {
     const resp = types.SyncRouteInfoResponse.decode(body);
     if (resp && resp.sessionId != null) {
+      // 会话重置冷却：sessionId 变化每连接 ≥1s 一次，1s 内的重复变化忽略，
+      // 防止异常回包借频繁重置强制全量重推。正常客户端仅在自身会话重启时
+      // 改变 sessionId（官方客户端随后会重试确认，自愈）。
+      const s = ctx.pm.getSession(ws._groupKey, header.fromPeerId);
+      const changed = !s || s.dstSessionId !== longToString(resp.sessionId);
+      if (changed) {
+        const now = Date.now();
+        const cooldown = ctx.config.fullResyncCooldownMs ?? FULL_RESYNC_COOLDOWN_MS;
+        const lastReset = ctx.getStamp ? ctx.getStamp(ws, '_lastSessionResetAt') : (ws._lastSessionResetAt || 0);
+        if (cooldown > 0 && now - lastReset < cooldown) {
+          if (ctx.counters) ctx.counters.resyncCooled = (ctx.counters.resyncCooled || 0) + 1;
+          ctx.log.debug(`route session reset cooled down from=${header.fromPeerId}`);
+          return;
+        }
+        ws._lastSessionResetAt = now;
+        if (ctx.saveAttachment) ctx.saveAttachment(ws); // 戳随 attachment 持久化
+      }
       ctx.pm.onRouteSessionAck(ws._groupKey, header.fromPeerId, resp.sessionId);
     }
   } catch {
@@ -413,14 +521,16 @@ function buildZC(ctx, toPeerId, packetType, payload) {
 
 /**
  * 官方摘要算法：sha256(排序键 + 延迟) 前 8 字节 -> u64 字符串。
+ * 键为十进制 peerId 字符串，按数值排序（显式比较器；摘要为服务端自比较
+ * 语义，排序变化仅改变摘要常数，行为不变）。
  */
 async function computePeerCenterDigest(snapshot) {
-  const keys = Object.keys(snapshot).sort();
+  const keys = Object.keys(snapshot).sort((a, b) => Number(a) - Number(b));
   const parts = [];
   for (const k of keys) {
     parts.push(k);
     const dp = snapshot[k].directPeers || {};
-    for (const dk of Object.keys(dp).sort()) {
+    for (const dk of Object.keys(dp).sort((a, b) => Number(a) - Number(b))) {
       parts.push(dk);
       parts.push(String(dp[dk].latencyMs ?? 0));
     }

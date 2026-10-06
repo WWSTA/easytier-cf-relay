@@ -16,7 +16,7 @@ SERVER_PEER_ID = "10000001"
 # 服务端在握手响应中宣告的网络名（与客户端网络名不同 => 外部网络中继模式）
 SERVER_NETWORK_NAME = "public_server"
 SERVER_HOSTNAME = "easytier-cf-relay"
-SERVER_VERSION_STR = "easytier-cf-relay/1.5.0"
+SERVER_VERSION_STR = "easytier-cf-relay/1.6.0"
 # 指定 Durable Object 地区配置（可选值：wnam 西部地区（北美）enam 东部地区（北美）sam 南美洲 weur 西欧 eeur 东欧 apac	亚太地区（已设置，默认未开启） oc 大洋洲 afr 非洲 me 中东）
 # LOCATION_HINT = "apac"
 # 纯 P2P 模式：1 = 在 feature_flag 中宣告 avoid_relay_data（OSPF 给本节点边赋大代价，
@@ -107,7 +107,21 @@ IP_BLOCK_CACHE_MS = "30000"
 # Web 管理端路径（需与 ADMIN_TOKEN 同时配置才启用；页面壳公开、数据 API 鉴权）
 # ADMIN_PATH = "/admin-please-change-me"
 # 管理端 token（状态查看 / 踢出节点 / 删除分组）
+# ⚠️ 安全建议：token 属敏感信息，生产环境建议用
+#   npx wrangler secret put ADMIN_TOKEN
+# 注入而非写在本文件明文（与 CF_API_TOKEN 同模式）；本文件可能随仓库/备份/截图外泄
 # ADMIN_TOKEN = "please-change-me-to-another-long-random-string"
+# ---------------------------------------------------------------------------
+# 账号级真实额度 + AE 趋势（v1.6，全部可选 —— 不配置则管理页回退自观测估算）
+# ---------------------------------------------------------------------------
+# Cloudflare 账号 ID（Dashboard 右侧 / Workers 概览页可见，非敏感）
+# CF_ACCOUNT_ID = "your-cloudflare-account-id"
+# Cloudflare API Token：必须用 secret 注入，绝不写入本文件明文！
+#   npx wrangler secret put CF_API_TOKEN
+#   权限只给「Account Analytics: Read」（供 GraphQL 额度查询与 AE SQL 趋势查询共用），
+#   可随时在 Dashboard 吊销。见部署手册「额度观测与趋势」章节
+# 查询的 Worker 脚本名（默认 easytier-cf-relay；改名部署时需同步）
+# CF_SCRIPT_NAME = "easytier-cf-relay"
 
 [durable_objects]
 bindings = [
@@ -119,6 +133,17 @@ bindings = [
 # [[kv_namespaces]]
 # binding = "AUDIT_KV"
 # id = "<你的 KV namespace id>"
+# Analytics Engine 绑定（v1.6：趋势打点，免费计划含 100,000 数据点/天；
+# 本方案每分钟 1 点 ≈ 1,440/天）。绑定即自动建数据集，无需额外创建步骤
+# ⚠️ 注意：本绑定要求账号先在 Dashboard 一次性开通 Analytics Engine
+#   （Workers & Pages → Analytics Engine → Enable，免费、无需绑卡）；
+#   未开通时 `wrangler deploy` 会报错 10089「You need to enable Analytics
+#   Engine」，整个部署失败（线上不受影响，开通后重跑即可）。不需要趋势图
+#   可注释掉下面 3 行——代码自动降级，其余功能不受影响。
+# 打开 https://dash.cloudflare.com/{CF_ACCOUNT_ID}/workers/analytics-engine
+# [[analytics_engine_datasets]]
+# binding = "AE"
+# dataset = "easytier-cf-relay"
 
 [[migrations]]
 tag = "v1"

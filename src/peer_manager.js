@@ -18,9 +18,10 @@ import Long from 'long';
 import {
   PEER_CENTER_TTL_MS, SESSION_TTL_MS,
   ROUTE_INFO_TTL_MS, ROUTE_INFO_UNREACHABLE_MS,
+  MAX_ROUTES_PER_GROUP, MAX_ROUTE_INFO_BYTES,
 } from './constants.js';
 import { randomU64Long, longToString } from './proto.js';
-import { generateNetworkDigest, bytesToHex } from './siphash.js';
+import { generateNetworkDigest, bytesToHex, randomBytes } from './siphash.js';
 function nowTs() {
   const ms = Date.now();
   return { seconds: Long.fromNumber(Math.floor(ms / 1000)), nanos: (ms % 1000) * 1e6 };
@@ -64,6 +65,10 @@ export class PeerManager {
     if (!Number.isFinite(this.config.routeInfoUnreachableMs) || !(this.config.routeInfoUnreachableMs > 0)) {
       this.config.routeInfoUnreachableMs = ROUTE_INFO_UNREACHABLE_MS;
     }
+    // 资源滥用防线兜底（直接构造 PeerManager 的场景，如单元测试）；undefined
+    // 取默认值，0 = 显式关闭（buildConfig 的 intOrZero 语义）
+    if (this.config.maxRoutesPerGroup === undefined) this.config.maxRoutesPerGroup = MAX_ROUTES_PER_GROUP;
+    if (this.config.maxRouteInfoBytes === undefined) this.config.maxRouteInfoBytes = MAX_ROUTE_INFO_BYTES;
     /** @type {Map<string, {peers:Map<number,WebSocket>, infos:Map<number,object>, rawInfos:Map<number,Uint8Array>, connVersions:Map<number,number>, sessions:Map<number,object>, peerCenter:object}>} */
     this.groups = new Map();
     /** @type {Map<string,string>} networkName -> digestHex（仅 strictDigest 模式使用） */
@@ -91,12 +96,17 @@ export class PeerManager {
 
   ensureServerIdentity() {
     if (this.serverIdentity) return this.serverIdentity;
+    // instId 使用 CSPRNG：instId 会广播
+    // 给分组内所有客户端、本身不是秘密，但弱随机的会话/实例标识没有存在理由，
+    // 项目内已有 randomBytes 封装（crypto.getRandomValues），替换零成本。
+    const rb = randomBytes(16);
+    const rdv = new DataView(rb.buffer, rb.byteOffset, rb.byteLength);
     this.serverIdentity = {
       instId: {
-        part1: Math.floor(Math.random() * 0xffffffff),
-        part2: Math.floor(Math.random() * 0xffffffff),
-        part3: Math.floor(Math.random() * 0xffffffff),
-        part4: Math.floor(Math.random() * 0xffffffff),
+        part1: rdv.getUint32(0),
+        part2: rdv.getUint32(4),
+        part3: rdv.getUint32(8),
+        part4: rdv.getUint32(12),
       },
       peerRouteId: randomU64Long(),
       startedAt: Date.now(),
@@ -141,7 +151,9 @@ export class PeerManager {
         infoReporters: new Map(), // 幽灵防线：pid -> Set(上报该 transit 条目的在线节点)
         connVersions: new Map(),
         sessions: new Map(),
-        peerCenter: { globalPeerMap: new Map(), digest: '0' },
+        // PeerCenter：digest 缓存 + 脏标——dirty=false 时
+        // GetGlobalPeerMap 缓存命中不再重建快照/重算 SHA-256
+        peerCenter: { globalPeerMap: new Map(), digest: '0', dirty: false },
         networkName: networkName || networkNameOfKey(groupKey),
         emptySince: Date.now(), // 在线节点归零的时刻（用于空分组自动删除）
       };
@@ -269,9 +281,13 @@ export class PeerManager {
    * @param {Uint8Array|null} rawBytes 该条信息的原始 wire 字节（未知字段保留）
    * @param {'direct'|'transit'} source direct=该 peer 本人上报；transit=其他 peer 转述
    * @param {number|null} reporterPid 上报者 peerId（transit 时用于追踪来源）
-   * @returns {{isNew:boolean, changed:boolean, rejected:boolean}}
+   * @param {{deferBump?:boolean, deferEmit?:boolean}|null} [opts]
+   *   批量处理路径（SyncRouteInfo 单帧多条目）使用：deferBump 把
+   *   bumpAllConnVersions 上提为每帧一次（逐条调用为 O(n²)）；
+   *   deferEmit 把 route-add 事件上提给调用方按帧聚合。两者缺省时行为不变。
+   * @returns {{isNew:boolean, changed:boolean, rejected:boolean, oversized?:boolean, capped?:boolean}}
    */
-  updatePeerInfo(groupKey, info, rawBytes = null, source = 'direct', reporterPid = null) {
+  updatePeerInfo(groupKey, info, rawBytes = null, source = 'direct', reporterPid = null, opts = null) {
     if (!info || typeof info.peerId !== 'number') {
       return { isNew: false, changed: false, rejected: false };
     }
@@ -279,7 +295,25 @@ export class PeerManager {
     if (pid === this.config.serverPeerId) return { isNew: false, changed: false, rejected: false };
     const g = this.ensureGroup(groupKey);
     const now = Date.now();
+
+    // 单条条目体积上限：巨型条目（如超长 hostname）会同时膨胀内存状态、
+    // 出站全量推送与落盘负载。超出丢弃该条（官方典型条目 ~100-300B，
+    // 上限 768B 留 3× 余量）。
+    const capBytes = this.config.maxRouteInfoBytes;
+    if (capBytes > 0) {
+      const oversize = (rawBytes != null && rawBytes.length > capBytes)
+        || (info.hostname != null && String(info.hostname).length > capBytes);
+      if (oversize) return { isNew: false, changed: false, rejected: true, oversized: true };
+    }
+    // 分组条目总量上限：transit/幽灵条目的总量闸门，同时
+    // 是出站全量推送的体积上界。新增条目超限拒绝，已有条目的刷新不受影响。
+    const capCount = this.config.maxRoutesPerGroup;
     const existing = g.infos.get(pid);
+    if (capCount > 0 && !existing) {
+      if (g.infos.size >= capCount) {
+        return { isNew: false, changed: false, rejected: true, capped: true };
+      }
+    }
     const existingSource = g.infoSource.get(pid);
 
     // 幽灵防线 A：已连接节点的条目只接受其本人自报（防他报覆盖在线节点）
@@ -301,8 +335,11 @@ export class PeerManager {
       if (source === 'transit') {
         g.infoReporters.set(pid, reporterPid != null ? new Set([reporterPid]) : new Set());
       }
-      this.bumpAllConnVersions(groupKey);
-      this._emit({ kind: 'route-add', groupKey, peerId: pid, source });
+      // 批量路径（deferBump/deferEmit）由调用方每帧统一 bump / 按帧聚合 emit
+      if (!(opts && opts.deferBump)) this.bumpAllConnVersions(groupKey);
+      if (!(opts && opts.deferEmit)) {
+        this._emit({ kind: 'route-add', groupKey, peerId: pid, source });
+      }
       return { isNew: true, changed: true, rejected: false };
     }
 
@@ -609,6 +646,7 @@ export class PeerManager {
       for (const [pid, e] of g.peerCenter.globalPeerMap) {
         if (now - (e.lastSeen || 0) > PEER_CENTER_TTL_MS) {
           g.peerCenter.globalPeerMap.delete(pid);
+          g.peerCenter.dirty = true; // 缓存失效（脏标）
           this._emit({ kind: 'pc-remove', groupKey: this._keyOfGroup(g), peerId: Number(pid), cause: 'expire' });
         }
       }
@@ -623,6 +661,7 @@ export class PeerManager {
       lastSeen: Date.now(),
     });
     pc.digest = '0'; // 失效缓存
+    pc.dirty = true; // 脏标：下次 GetGlobalPeerMap 重建快照与摘要
     // 审计：仅记录新增/移除，周期性刷新不记录（避免刷屏）
     if (isNew) this._emit({ kind: 'pc-report', groupKey, peerId: Number(myPeerId) });
   }
@@ -738,6 +777,7 @@ export class PeerManager {
       }
     }
     g.peerCenter.digest = '0'; // 失效缓存
+    g.peerCenter.dirty = true; // 脏标
     return { ok: true, removed };
   }
 
@@ -928,14 +968,31 @@ export class PeerManager {
 
   // ---------- 持久化 ----------
 
-  toPersisted() {
+  /**
+   * 序列化为可持久化结构。
+   * @param {{dropRaw?:boolean, trimEntries?:number}|null} [opts]
+   *   落盘预算降级选项（由 room._flushState 在 storage.put 失败时使用，
+   *   正常路径 opts=null 零开销）：dropRaw 丢弃原始 wire 字节（JSON 数字数组
+   *   持久化 4-5× 膨胀的主要来源，丢弃后退对象路径）；trimEntries 为每组保留
+   *   的最大条目数（按 updated 保留最新）。
+   */
+  toPersisted(opts = null) {
+    const dropRaw = !!(opts && opts.dropRaw);
+    const trim = opts && Number.isInteger(opts.trimEntries) && opts.trimEntries > 0
+      ? opts.trimEntries : 0;
     const id = this.ensureServerIdentity();
     const groups = {};
     for (const [gk, g] of this.groups) {
       if (g.infos.size === 0) continue;
+      let entries = Array.from(g.infos);
+      if (trim && entries.length > trim) {
+        entries.sort((a, b) =>
+          (g.infoUpdatedAt.get(b[0]) ?? 0) - (g.infoUpdatedAt.get(a[0]) ?? 0));
+        entries = entries.slice(0, trim);
+      }
       const infos = {};
-      for (const [pid, info] of g.infos) {
-        const raw = g.rawInfos.get(pid);
+      for (const [pid, info] of entries) {
+        const raw = dropRaw ? null : g.rawInfos.get(pid);
         const entry = raw ? { info, raw: Array.from(raw) } : { info };
         const source = g.infoSource.get(pid);
         if (source) entry.source = source;
