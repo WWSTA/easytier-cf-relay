@@ -8,6 +8,7 @@
 <div align="center">
 <img src="assets/icon.svg" width="110" alt="EasyTier Cloudflare Relay 图标"/>
 </div>
+
 [![版本](https://img.shields.io/badge/版本-v1.6.1-6699FF?style=flat-square)](docs/更新日志.md) [![Stars](https://img.shields.io/github/stars/WWSTA/easytier-cf-relay?style=flat-square&logo=github&label=Stars&color=ffcb2d)](https://github.com/WWSTA/easytier-cf-relay/stargazers) [![License](https://img.shields.io/github/license/WWSTA/easytier-cf-relay?style=flat-square&color=1a7f37)](LICENSE) [![平台](https://img.shields.io/badge/平台-Cloudflare_Workers-F6821F?style=flat-square&logo=cloudflare&logoColor=white)](https://workers.cloudflare.com/) [![实测](https://img.shields.io/badge/官方实测-easytier--core_2.6.4-1a7f37?style=flat-square)](docs/技术文档.md) [![语言](https://img.shields.io/badge/语言-JavaScript-f7df1e?style=flat-square&logo=javascript&logoColor=black)](#) [![Wrangler](https://img.shields.io/badge/Wrangler-v4-0969da?style=flat-square)](#)
 
 由于作者不太会Workers的开发，所以使用了**国模**进行全栈开发。虽然与国模进行了不少友好交流，但是可能仍然有一些不影响使用的特性，下个版本会继续修，欢迎各位有想法的fork修理。（更新花费越来越大，总花费和使用模型可以看更新日志）
