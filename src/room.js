@@ -78,11 +78,17 @@ export function buildConfig(env) {
       networkSecrets = null;
     }
   }
+  // 趋势 SQL 的 AE 数据集名（须与 [[analytics_engine_datasets]] 的 dataset 一致；
+  // AE 绑定无法在运行时读取自身 dataset 名，wrangler 未写 dataset 时默认取 Worker 名）。
+  // 仅允许字母数字与 - _，非法值回退默认，防止拼坏 SQL
+  const aeDataset = /^[A-Za-z0-9_-]+$/.test(str(env, 'AE_DATASET', ''))
+    ? str(env, 'AE_DATASET', '')
+    : 'easytier_relay';
   return {
     serverPeerId: int(env, 'SERVER_PEER_ID', 10000001) >>> 0,
     serverNetworkName: str(env, 'SERVER_NETWORK_NAME', 'public_server'),
     serverHostname: str(env, 'SERVER_HOSTNAME', 'easytier-cf-relay'),
-    serverVersionStr: str(env, 'SERVER_VERSION_STR', 'easytier-cf-relay/1.6.0'),
+    serverVersionStr: str(env, 'SERVER_VERSION_STR', 'easytier-cf-relay/1.6.1'),
     avoidRelayData: bool(env, 'AVOID_RELAY_DATA', true),
     relayData: bool(env, 'RELAY_DATA', true),
     maxPeersPerRoom: int(env, 'MAX_PEERS_PER_ROOM', 64),
@@ -140,6 +146,7 @@ export function buildConfig(env) {
     // 绝不写入 toml 明文、绝不下发浏览器/日志/审计
     cfApiToken: str(env, 'CF_API_TOKEN', ''),
     cfScriptName: str(env, 'CF_SCRIPT_NAME', 'easytier-cf-relay'),
+    aeDataset,
   };
 }
 
@@ -1803,27 +1810,20 @@ export class RelayRoom {
     return Response.json(payload);
   }
 
-  /** AE SQL API 端点 */
-  _aeSqlUrl(account) {
-    return `https://api.cloudflare.com/client/v4/accounts/${account}/analytics_engine/sql`;
-  }
-
   /**
    * SQL 服务端分桶查询：返回 {source:'ae', points, fetchedAt} 或抛错。
    * msgsPerMin = 桶内收包累计增量 / 桶长分钟（DO 重启导致负增量钳为 0）。
    */
   async _trendsSqlBuckets(account, token, hours, bucketSec, now) {
-    const sql = `SELECT intDiv(toUInt32(timestamp), ${bucketSec}) * ${bucketSec} AS bucket, `
-      + `avg(double1) AS peers, min(double3) AS mi0, max(double3) AS mi1 `
-      + `FROM easytier_relay WHERE timestamp > NOW() - INTERVAL '${hours}' HOUR `
-      + `GROUP BY bucket ORDER BY bucket ASC`;
-    const rows = await this._aeSqlQuery(account, token, sql);
+    const { rows } = await this._aeSqlTry(token, this._trendsSqlForms(hours, bucketSec, 'buckets'));
     const points = [];
     const bucketMs = bucketSec * 1000;
     for (const r of rows) {
-      const t = (Number(r[0]) || 0) * 1000;
-      const peers = Number(r[1]) || 0;
-      const delta = Math.max(0, (Number(r[3]) || 0) - (Number(r[2]) || 0));
+      // AE JSON 响应按列名取数（data 行对象），与列顺序无关；
+      // UInt64 列可能以字符串给出，Number() 对数字/字符串双兼容
+      const t = (Number(r.bucket) || 0) * 1000;
+      const peers = Number(r.peers) || 0;
+      const delta = Math.max(0, (Number(r.mi1) || 0) - (Number(r.mi0) || 0));
       points.push({ t, peers: Math.round(peers * 10) / 10, msgsPerMin: Math.round(delta / (bucketMs / 60000)) });
     }
     return { source: 'ae', points, fetchedAt: now };
@@ -1831,18 +1831,15 @@ export class RelayRoom {
 
   /** 回退：原始点查询（≤LIMIT 10000）+ 服务端 JS 分桶聚合 */
   async _trendsRawFallback(account, token, hours, bucketSec, now) {
-    const sql = `SELECT timestamp, double1, double3 FROM easytier_relay `
-      + `WHERE timestamp > NOW() - INTERVAL '${hours}' HOUR `
-      + `ORDER BY timestamp ASC LIMIT 10000`;
-    const rows = await this._aeSqlQuery(account, token, sql);
+    const { rows } = await this._aeSqlTry(token, this._trendsSqlForms(hours, bucketSec, 'raw'));
     const buckets = new Map(); // bucketStartMs -> {peerSum, n, mi0, mi1}
     for (const r of rows) {
-      const t = parseAeTimestamp(r[0]);
+      const t = parseAeTimestamp(r.timestamp);
       if (!Number.isFinite(t)) continue;
       const b = Math.floor(t / (bucketSec * 1000)) * bucketSec * 1000;
       const cur = buckets.get(b) || { peerSum: 0, n: 0, mi0: Infinity, mi1: -Infinity };
-      const peers = Number(r[1]) || 0;
-      const mi = Number(r[2]) || 0;
+      const peers = Number(r.double1) || 0;
+      const mi = Number(r.double3) || 0;
       cur.peerSum += peers; cur.n += 1;
       cur.mi0 = Math.min(cur.mi0, mi);
       cur.mi1 = Math.max(cur.mi1, mi);
@@ -1861,22 +1858,82 @@ export class RelayRoom {
     return { source: 'ae', points, fetchedAt: now, fallback: true };
   }
 
-  /** 执行 AE SQL 查询并解析 CSV 响应（SQL API 返回 text/csv，首行为表头） */
-  async _aeSqlQuery(account, token, sql) {
+  /**
+   * AE 查询形态序列（端点 × 方言）：Cloudflare 2026-10 起新增 Analytics SQL API
+   * （POST /client/v4/analytics/sql，schema 限定名 events.analyticsEngine."<名>"，
+   * 含连字符的数据集名用双引号，WAE 数据集须带 accountTag 过滤）；而旧端点
+   * /accounts/<id>/analytics_engine/sql 仍用旧语法——裸名、无任何引号机制，
+   * 连字符数据集名在其语法中无法表达（422 Expected end of statement）。
+   * 按数据集名是否含连字符生成序列并依次尝试，成功形态在内存记忆
+   * （DO 重启后重探测，代价为至多 1 次失败请求/5min 缓存周期）。
+   */
+  _trendsSqlForms(hours, bucketSec, kind) {
+    const acct = this.config.cfAccountId;
+    const ds = this.config.aeDataset;
+    const OLD = `https://api.cloudflare.com/client/v4/accounts/${acct}/analytics_engine/sql`;
+    const NEW = 'https://api.cloudflare.com/client/v4/analytics/sql';
+    const time = `timestamp > NOW() - INTERVAL '${hours}' HOUR`;
+    const tag = `accountTag = '${acct}'`;
+    const dashless = /^[A-Za-z0-9_]+$/.test(ds);
+    const pairs = [];
+    if (kind === 'buckets') {
+      const agg = `intDiv(toUInt32(timestamp), ${bucketSec}) * ${bucketSec} AS bucket, `
+        + `avg(double1) AS peers, min(double3) AS mi0, max(double3) AS mi1`;
+      if (dashless) {
+        pairs.push({ url: OLD, sql: `SELECT ${agg} FROM ${ds} WHERE ${time} GROUP BY bucket ORDER BY bucket ASC FORMAT JSON` });
+      }
+      pairs.push({ url: NEW, sql: `SELECT ${agg} FROM events.analyticsEngine."${ds}" WHERE ${tag} AND ${time} GROUP BY bucket ORDER BY bucket ASC` });
+      if (!dashless) {
+        pairs.push({ url: OLD, sql: `SELECT ${agg} FROM ${ds} WHERE ${time} GROUP BY bucket ORDER BY bucket ASC FORMAT JSON` });
+      }
+    } else {
+      const sel = 'timestamp, double1, double3';
+      if (dashless) {
+        pairs.push({ url: OLD, sql: `SELECT ${sel} FROM ${ds} WHERE ${time} ORDER BY timestamp ASC LIMIT 10000 FORMAT JSON` });
+      }
+      pairs.push({ url: NEW, sql: `SELECT ${sel} FROM events.analyticsEngine."${ds}" WHERE ${tag} AND ${time} ORDER BY timestamp ASC LIMIT 10000` });
+      if (!dashless) {
+        pairs.push({ url: OLD, sql: `SELECT ${sel} FROM ${ds} WHERE ${time} ORDER BY timestamp ASC LIMIT 10000 FORMAT JSON` });
+      }
+    }
+    return pairs;
+  }
+
+  /** 依次尝试形态序列：成功即记忆形态下标并返回 {rows}；全败抛聚合错误（含各形态诊断原文） */
+  async _aeSqlTry(token, forms) {
+    const start = Math.max(0, Math.min(this._trendsFormIdx || 0, forms.length - 1));
+    const errs = [];
+    for (let k = 0; k < forms.length; k++) {
+      const i = (start + k) % forms.length;
+      try {
+        const rows = await this._aeSqlQuery(token, forms[i].url, forms[i].sql);
+        this._trendsFormIdx = i;
+        return { rows };
+      } catch (e) {
+        errs.push(`[${i}] ${e && e.message || e}`);
+      }
+    }
+    throw new Error(`全部 ${forms.length} 个 AE 查询形态失败: ${errs.join(' | ').slice(0, 400)}`);
+  }
+
+  /** 执行 AE SQL 查询并解析 JSON 响应（响应 {meta,data} 或顶层数组，返回 data 行对象，按列名取数） */
+  async _aeSqlQuery(token, url, sql) {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 8000);
     try {
-      const res = await fetch(this._aeSqlUrl(account), {
+      const res = await fetch(url, {
         method: 'POST',
         headers: { Authorization: `Bearer ${token}`, 'content-type': 'text/plain' },
         body: sql,
         signal: ctrl.signal,
       });
-      if (!res.ok) throw new Error(`ae sql HTTP ${res.status}`);
-      const text = await res.text();
-      const lines = text.trim().split('\n');
-      if (lines.length < 2) return []; // 仅表头 → 无数据
-      return lines.slice(1).map((l) => l.split(','));
+      if (!res.ok) {
+        const body = await res.text().catch(() => '');
+        throw new Error(`ae sql HTTP ${res.status}: ${String(body).replace(/\s+/g, ' ').slice(0, 160)}`);
+      }
+      const j = await res.json();
+      if (Array.isArray(j)) return j; // 防御：JSONEachRow 形状（顶层数组）
+      return j && Array.isArray(j.data) ? j.data : [];
     } finally {
       clearTimeout(timer);
     }

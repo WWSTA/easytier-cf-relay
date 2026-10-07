@@ -16,7 +16,7 @@ SERVER_PEER_ID = "10000001"
 # 服务端在握手响应中宣告的网络名（与客户端网络名不同 => 外部网络中继模式）
 SERVER_NETWORK_NAME = "public_server"
 SERVER_HOSTNAME = "easytier-cf-relay"
-SERVER_VERSION_STR = "easytier-cf-relay/1.6.0"
+SERVER_VERSION_STR = "easytier-cf-relay/1.6.1"
 # 指定 Durable Object 地区配置（可选值：wnam 西部地区（北美）enam 东部地区（北美）sam 南美洲 weur 西欧 eeur 东欧 apac	亚太地区（已设置，默认未开启） oc 大洋洲 afr 非洲 me 中东）
 # LOCATION_HINT = "apac"
 # 纯 P2P 模式：1 = 在 feature_flag 中宣告 avoid_relay_data（OSPF 给本节点边赋大代价，
@@ -41,6 +41,21 @@ MSG_RATE_LIMIT_PER_SEC = "50"
 MAX_PEERS_PER_GROUP = "32"
 # 单条 WS 消息最大字节数（EasyTier MTU 默认 1380，RPC 路由同步会更大）
 MAX_MESSAGE_BYTES = "131072"
+# 资源滥用防线（v1.6.0）：全部为处理途中同步检查，正常用户零开销；0 = 关闭该防线
+# 上限自洽不变量：MAX_ROUTES_PER_GROUP × MAX_ROUTE_INFO_BYTES 须 < MAX_MESSAGE_BYTES
+#（不自洽时启动日志 warn，合法全量推送可能被出站硬闸丢弃）
+MAX_SYNC_ITEMS = "256"
+# 单条 RoutePeerInfo 原始字节上限，超出丢弃该条（防巨型条目状态膨胀；官方典型条目 ~100-300B）
+MAX_ROUTE_INFO_BYTES = "768"
+# 每分组路由条目总数上限（transit/幽灵条目总量闸门，兼作出站全量推送体积上界）
+MAX_ROUTES_PER_GROUP = "128"
+# PeerCenter 单上报者直连表条目上限，超出截断
+MAX_DIRECT_PEERS_REPORT = "64"
+# 全量重推最小间隔（毫秒）：会话重置 / GetGlobalPeerMap 全量响应共用，每连接
+FULL_RESYNC_COOLDOWN_MS = "1000"
+# 握手网络名长度上限（空名 / 超长名拒绝，close 4002）
+MAX_NETWORK_NAME_BYTES = "128"
+
 # 未握手连接超时（毫秒）—— 幽灵连接清理
 HANDSHAKE_TIMEOUT_MS = "15000"
 # 空闲超时（毫秒）。必须大于客户端 ping 最大间隔 32s
@@ -83,6 +98,12 @@ BLACKLIST_LIMIT = "1000"
 # 这是硬设置 —— 管理页无法关闭 admin 类记录，也无法删除其内容
 ADMIN_AUDIT = "1"
 ADMIN_AUDIT_LIMIT = "200"
+# 审计数据最小化（v1.6.0，均可选）：
+# AUDIT_IP_MASK = "1" 时记录内客户端 IP 打码（IPv4 保留 /16 如 1.2.x.x、IPv6 前 4 组），
+# 黑名单存储、踢人拉黑、边缘拦截仍使用完整 IP 不受影响；默认 0 = 关闭
+AUDIT_IP_MASK = "0"
+# 记录留存天数：alarm 每小时清理一次过期运行记录（admin 硬审计豁免）；默认 0 = 不限
+AUDIT_RETENTION_DAYS = "0"
 # 边缘层 IP 黑名单缓存（毫秒）：isolate 内缓存 bl:socket 的 KV 读结果，
 # 重连风暴时 KV 读从每次连接 1 次降为每 TTL 1 次。只延后拦截、绝不漏放
 # （缓存未命中照旧放行走 DO 权威检查）。0 = 关闭
@@ -120,9 +141,14 @@ IP_BLOCK_CACHE_MS = "30000"
 #   npx wrangler secret put CF_API_TOKEN
 #   权限只给「Account Analytics: Read」（供 GraphQL 额度查询与 AE SQL 趋势查询共用），
 #   可随时在 Dashboard 吊销。见部署手册「额度观测与趋势」章节
+# 建议打开 https://dash.cloudflare.com/profile/api-tokens 选模板
 # 查询的 Worker 脚本名（默认 easytier-cf-relay；改名部署时需同步）
 # CF_SCRIPT_NAME = "easytier-cf-relay"
 
+# 趋势查询的 AE 数据集名：必须与 [[analytics_engine_datasets]] 的 dataset 一致
+#（AE 绑定无法在运行时读取自身 dataset 名；wrangler 未写 dataset 时默认取 Worker 名）。
+# 默认 easytier-cf-relay 与发行配置的绑定一致；绑定改名的部署两处须一起改
+AE_DATASET = "easytier-cf-relay"
 [durable_objects]
 bindings = [
   { name = "RELAY_ROOM", class_name = "RelayRoom" }

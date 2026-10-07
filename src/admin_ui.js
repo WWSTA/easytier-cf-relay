@@ -1184,6 +1184,7 @@ function refreshQuotaCard(force) {
     if (q.source === 'unconfigured') {
       QUOTA_UNCONF = true; // 记住，后续自动刷新跳过
       el.innerHTML = unconfHintHtml('quota');
+      layoutMasonry(); // 异步替换后卡片高度变化，瀑布流需重排（否则同列下方卡片遮挡）
       return;
     }
     if (q.source === 'cloudflare') {
@@ -1209,9 +1210,11 @@ function refreshQuotaCard(force) {
       var calEl = $('quota-cal');
       if (calEl) calEl.innerHTML = kv('口径', '真实额度：Cloudflare GraphQL（Account Analytics: Read），缓存 5 分钟', null,
         '查询失败时自动回退自观测估算，不影响总览页可用性');
+      layoutMasonry(); // 真实模式卡片变高，重排瀑布流
     } else if (q.source === 'unavailable') {
       el.innerHTML = kv('真实额度', '查询失败，当前显示估算', 'bad',
         '原因：' + (q.error || '未知') + '。请检查 CF_ACCOUNT_ID / CF_API_TOKEN（wrangler secret put）及其权限（Account Analytics: Read）');
+      layoutMasonry();
     }
   }).catch(function () { /* 静默：保留估算显示（404 时 api 已有统一语义） */ });
 }
@@ -1330,9 +1333,10 @@ function drawTrends(j) {
     '<span><span class="sw" style="background:var(--ok)"></span>在线节点（峰值 ' + maxPeersRaw + '）</span>' +
     '<span><span class="sw" style="background:var(--warn)"></span>收包速率（峰值 ' + maxRateRaw + '/min）</span>' +
     '<span style="margin-left:auto">每 ' + (j.bucketSec / 60) + ' 分钟一桶' + (j.cached ? ' · 服务端缓存' : '') + '</span></div>';
-  el.innerHTML = '<div class="chart" id="trendChart"><div class="chart-tip" id="trendTip"></div></div>' + legend;
+  el.innerHTML = '<div class="chart" id="trendChart"></div>' + legend;
   var chartBox = $('trendChart');
-  chartBox.innerHTML = '<svg width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + ' ' + H + '">' + s + '</svg>';
+  // 悬停提示层必须与 svg 同批注入——innerHTML 重写容器，分两步写会清掉先建的提示层
+  chartBox.innerHTML = '<svg width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + ' ' + H + '">' + s + '</svg><div class="chart-tip" id="trendTip"></div>';
   // 悬停最近点吸附
   chartBox.onmousemove = function (ev) {
     var rect = chartBox.getBoundingClientRect();
