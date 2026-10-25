@@ -151,17 +151,6 @@ export function bytesToHex(bytes) {
   return s;
 }
 
-/** hex -> bytes */
-export function hexToBytes(hex) {
-  const clean = String(hex || '').replace(/[^0-9a-fA-F]/g, '');
-  if (clean.length % 2 !== 0) return new Uint8Array(0);
-  const out = new Uint8Array(clean.length / 2);
-  for (let i = 0; i < out.length; i++) {
-    out[i] = parseInt(clean.substring(i * 2, i * 2 + 2), 16);
-  }
-  return out;
-}
-
 /** 加密安全的随机字节 */
 export function randomBytes(n) {
   const out = new Uint8Array(n);

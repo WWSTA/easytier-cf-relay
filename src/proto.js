@@ -66,7 +66,6 @@ export function toU64Long(value) {
   if (Long.isLong(value)) return value.unsigned ? value : value.toUnsigned();
   if (typeof value === 'bigint') return Long.fromValue(value, true);
   if (typeof value === 'string') {
-    if (/^-?\d+$/.test(value)) return Long.fromString(value, true);
     return Long.fromString(value, true);
   }
   if (typeof value === 'number') return Long.fromNumber(value >>> 0 === value ? value : 0, true);

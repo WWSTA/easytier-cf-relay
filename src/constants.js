@@ -112,5 +112,25 @@ export const MAX_DIRECT_PEERS_REPORT = 64;
 export const FULL_RESYNC_COOLDOWN_MS = 1000;
 /** 握手网络名长度上限：超长网络名会直接进 groupKey/持久化 */
 export const MAX_NETWORK_NAME_BYTES = 128;
-/** 持久化单值预算（字节）：DO storage 单值上限 128 KiB，留余量；超限走两段降级 */
-export const PERSIST_BUDGET_BYTES = 96 * 1024;
+
+// ---------------------------------------------------------------------------
+// WebSocket close code（4000-4030，本实现自定义区间）。
+// 历史原因存在双语义码：用双键同值显式表达（同一数值，语义随调用点不同——
+// 4008 既用于速率限流也用被踢出，4009 既用于入站超大消息也用于路由洪泛整帧拒绝）。
+// ---------------------------------------------------------------------------
+export const WS_CLOSE = Object.freeze({
+  REPLACED: 4000,        // 新连接顶替旧连接（同 peerId 重连）
+  TIMEOUT: 4001,         // 握手超时 / 空闲超时
+  MALFORMED: 4002,       // 帧格式或握手字段非法（bad handshake/magic/version/peer id/network name）
+  UNSUPPORTED: 4003,     // 安全模式不支持 / 网络摘要不匹配
+  RATE_LIMITED: 4008,    // 单连接消息速率超限（MSG_RATE_LIMIT_PER_SEC）
+  KICKED: 4008,          // 与 RATE_LIMITED 同码：被管理员踢出
+  OVERSIZED: 4009,       // 单帧超过消息大小上限（MAX_MESSAGE_BYTES）
+  ROUTE_FLOOD: 4009,     // 与 OVERSIZED 同码：单帧路由条目数超限整帧拒绝（MAX_SYNC_ITEMS）
+  GROUP_DELETED: 4010,   // 管理员删除分组
+  DIGEST_DELETED: 4011,  // 管理员删除摘要注册
+  ADMIN_CLOSED: 4012,    // 管理员关闭连接
+  BLACKLISTED: 4013,     // 黑名单拒绝
+  ROOM_FULL: 4029,       // 房间满（MAX_PEERS_PER_ROOM）
+  GROUP_FULL: 4030,      // 分组满（MAX_PEERS_PER_GROUP）
+});

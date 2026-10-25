@@ -16,7 +16,7 @@ SERVER_PEER_ID = "10000001"
 # 服务端在握手响应中宣告的网络名（与客户端网络名不同 => 外部网络中继模式）
 SERVER_NETWORK_NAME = "public_server"
 SERVER_HOSTNAME = "easytier-cf-relay"
-SERVER_VERSION_STR = "easytier-cf-relay/1.6.1"
+SERVER_VERSION_STR = "easytier-cf-relay/1.6.2"
 # 指定 Durable Object 地区配置（可选值：wnam 西部地区（北美）enam 东部地区（北美）sam 南美洲 weur 西欧 eeur 东欧 apac	亚太地区（已设置，默认未开启） oc 大洋洲 afr 非洲 me 中东）
 # LOCATION_HINT = "apac"
 # 纯 P2P 模式：1 = 在 feature_flag 中宣告 avoid_relay_data（OSPF 给本节点边赋大代价，
@@ -85,8 +85,9 @@ LOG_LEVEL = "info"
 # 不配置 AUDIT_KV 绑定时功能优雅降级：记录/黑名单仅存 Durable Object storage。
 # ---------------------------------------------------------------------------
 # 每类信息只占一条 KV 键（记录 7 条 + 黑名单 4 条，共 11 条）：
-#   记录键   et-relay:rec:<groups|peers|routes|peercenter|sockets|digests|admin>
-#   黑名单键 et-relay:bl:<peer|group|digest|socket>
+#   记录键   easytier-cf-relay:rec:<groups|peers|routes|peercenter|sockets|digests|admin>
+#   黑名单键 easytier-cf-relay:bl:<peer|group|digest|socket>
+#（旧前缀 et-relay: 仅作一次性迁移读取——src/audit.js LEGACY_KV_PREFIX，绝不写入）
 # KV 镜像最小间隔（毫秒）：事件先入内存+DO storage，按此间隔节流写 KV。
 # 免费额度 1000 写/天：默认 10 分钟间隔下每键最多 144 写/天
 RECORD_FLUSH_MS = "600000"

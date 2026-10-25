@@ -1,4 +1,4 @@
-# EasyTier Cloudflare Relay V1.6.1
+# EasyTier Cloudflare Relay V1.6.2
 
 在 Cloudflare Workers 免费额度内运行 EasyTier 自建 WebSocket 节点——无需 VPS，
 客户端 `-p wss://<你的域名>/` 即可组网。纯 P2P 优先（中继仅兜底），全 Hibernation API 空闲成本趋零。
@@ -8,23 +8,22 @@
 <div align="center">
 <img src="assets/icon.svg" width="110" alt="EasyTier Cloudflare Relay 图标"/>
 </div>
+[![版本](https://img.shields.io/badge/版本-v1.6.2-6699FF?style=flat-square)](docs/更新日志.md) [![Stars](https://img.shields.io/github/stars/WWSTA/easytier-cf-relay?style=flat-square&logo=github&label=Stars&color=ffcb2d)](https://github.com/WWSTA/easytier-cf-relay/stargazers) [![License](https://img.shields.io/github/license/WWSTA/easytier-cf-relay?style=flat-square&color=1a7f37)](LICENSE) [![平台](https://img.shields.io/badge/平台-Cloudflare_Workers-F6821F?style=flat-square&logo=cloudflare&logoColor=white)](https://workers.cloudflare.com/) [![实测](https://img.shields.io/badge/官方实测-easytier--core_2.6.4-1a7f37?style=flat-square)](docs/技术文档.md) [![语言](https://img.shields.io/badge/语言-JavaScript-f7df1e?style=flat-square&logo=javascript&logoColor=black)](#) [![Wrangler](https://img.shields.io/badge/Wrangler-v4-0969da?style=flat-square)](#)
 
-[![版本](https://img.shields.io/badge/版本-v1.6.1-6699FF?style=flat-square)](docs/更新日志.md) [![Stars](https://img.shields.io/github/stars/WWSTA/easytier-cf-relay?style=flat-square&logo=github&label=Stars&color=ffcb2d)](https://github.com/WWSTA/easytier-cf-relay/stargazers) [![License](https://img.shields.io/github/license/WWSTA/easytier-cf-relay?style=flat-square&color=1a7f37)](LICENSE) [![平台](https://img.shields.io/badge/平台-Cloudflare_Workers-F6821F?style=flat-square&logo=cloudflare&logoColor=white)](https://workers.cloudflare.com/) [![实测](https://img.shields.io/badge/官方实测-easytier--core_2.6.4-1a7f37?style=flat-square)](docs/技术文档.md) [![语言](https://img.shields.io/badge/语言-JavaScript-f7df1e?style=flat-square&logo=javascript&logoColor=black)](#) [![Wrangler](https://img.shields.io/badge/Wrangler-v4-0969da?style=flat-square)](#)
-
-由于作者不太会Workers的开发，所以使用了**国模**进行全栈开发。虽然与国模进行了不少友好交流，但是可能仍然有一些不影响使用的特性，下个版本会继续修，欢迎各位有想法的fork修理。（更新花费越来越大，总花费和使用模型可以看更新日志）
+本项目使用了**国模**进行全栈开发。虽然与国模进行了不少友好交流，但是可能仍然有一些不影响使用的特性，下个版本会继续修，欢迎各位有想法的fork修理。（免费的白米饭真好吃！）
 
 > [!TIP]
 >
-> V1.6.0版本大升级(V1.6.1修复了两个BUG），管理页换新，功能已尽可能完善，建议升级（后续更新会放缓，作者的大部分想法已实现，当然还有一些以后再说）（wrangler.toml 的配置比较多，建议使用wrangler.toml 配置生成器）
+> V1.6.0版本大升级(V1.6.1修复了两个BUG，V1.6.2为质量修复版），管理页换新，功能已尽可能完善，建议升级（后续更新会放缓，作者的大部分想法已实现，当然还有一些以后再说）（wrangler.toml 的配置项比较多，建议使用 wrangler.toml 配置生成器）
 
 
 ---
 
 ## 介绍站点
 
-本项目配套一套 介绍网站 ，包含：
+本项目配套一套 介绍网站 **(10.25全面更新，花了三周时间设计)**，包含：
 
-- **项目主页** — 功能特性、快速开始、架构图、成本与额度、已知限制
+- **项目主页** — 开始使用、功能特性、五分钟部署、架构图
 - **wrangler.toml 配置生成器** — 分类表单调整全部配置项（默认值与仓库 `wrangler.toml` 逐项一致），实时预览与校验，一键复制 / 下载可直接部署的配置文件**（建议使用）**
 - **文档网页版** — 部署手册 / 技术文档 / 更新日志全文收录，支持「完整 / 精炼」双视图与明暗主题切换
 
@@ -38,7 +37,7 @@
 
 > [!NOTE]
 >
-> 由于本作者的节点**域名**在"移动"的国际链路上可能被 **TLS SNI 黑名单拦截**，所以"移动"网络下可能会连接失败（只是作者用的域名有问题，服务器是没有问题，换一个域名其实就可以了，这段时间为了查明这个头疼了不久，所以更新慢了）
+> 由于本作者的节点**域名**在"移动"的国际链路上可能被 **TLS SNI 黑名单拦截**，所以"移动"网络下可能会连接失败（只是作者用的域名有问题，服务器是没有问题，换一个域名其实就可以了，这段时间为了查明这个头疼了不久，所以更新慢了）（额。。。好像是作者本地运营商的问题 ——26.10.25）
 
 ---
 

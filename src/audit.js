@@ -25,9 +25,9 @@
  *    刷爆记录列表并浪费写入额度）；拒绝次数改由 room.js 计数器统计。
  */
 
-export const RECORD_TYPES = ['groups', 'peers', 'routes', 'peercenter', 'sockets', 'digests', 'admin'];
+const RECORD_TYPES = ['groups', 'peers', 'routes', 'peercenter', 'sockets', 'digests', 'admin'];
 const RUNTIME_TYPES = ['groups', 'peers', 'routes', 'peercenter', 'sockets', 'digests'];
-export const BLACKLIST_CATS = ['peer', 'group', 'digest', 'socket'];
+const BLACKLIST_CATS = ['peer', 'group', 'digest', 'socket'];
 
 const STATE_KEY = 'audit_state';
 /** v1.4.1：KV 键前缀由 et-relay: 更名为项目名 easytier-cf-relay: */

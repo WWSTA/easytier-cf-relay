@@ -57,6 +57,8 @@ export function statsToPrometheus(stats) {
   counter('easytier_peermap_cooled_total', c.peerMapCooled);
   counter('easytier_resync_cooled_total', c.resyncCooled);
   counter('easytier_squat_suspect_total', c.squatSuspect);
+  // 落盘降级（v1.6.2 补齐）：持续增长说明路由状态体积异常（超 DO storage 单值预算）
+  counter('easytier_flush_degraded_total', c.flushDegraded);
 
   return lines.join('\n') + '\n';
 }

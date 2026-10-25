@@ -235,8 +235,9 @@ export class PeerManager {
       }
     }
     if (removed.length) {
-      const groupKey = this._keyOfGroup(g) || '';
-      if (groupKey) this.bumpAllConnVersions(groupKey);
+      // g 恒为 this.groups 的值（_keyOfGroup 必命中；即使未命中，
+      // bumpAllConnVersions 对未知 key 也是无操作）
+      this.bumpAllConnVersions(this._keyOfGroup(g));
     }
     return removed;
   }
@@ -252,11 +253,6 @@ export class PeerManager {
   getPeer(groupKey, peerId) {
     const g = this.groups.get(groupKey);
     return g ? g.peers.get(peerId) : undefined;
-  }
-
-  listPeerIds(groupKey) {
-    const g = this.groups.get(groupKey);
-    return g ? Array.from(g.peers.keys()) : [];
   }
 
   // ---------- 连接版本（conn bitmap 变更通知） ----------
@@ -448,10 +444,11 @@ export class PeerManager {
         deleted.push({ groupKey: gk, networkName: info.networkName, routeInfos: 0 });
       }
     }
-    // 孤儿摘要注册：分组不存在（或同样为空）时一并解除，防注册项永久残留
+    // 孤儿摘要注册：只处理孤儿注册项（组分已被删但注册项残留）——仍存在的
+    // 空分组由上方宽限期删除接管（clearGroup 会连同其注册项一并解除）
     for (const [name, digest] of Array.from(this.digestRegistry)) {
       const g = this.groups.get(`${name}:${digest}`);
-      if (!g || (g.peers.size === 0 && now - (g.emptySince ?? now) >= graceMs)) {
+      if (!g) {
         this.digestRegistry.delete(name);
       }
     }
@@ -795,6 +792,7 @@ export class PeerManager {
     const limit = Number.isInteger(opts.limit) && opts.limit > 0 ? Math.min(200, opts.limit) : 50;
     const groupFilter = opts.groupKey ? String(opts.groupKey) : '';
     const now = Date.now();
+    // 缺省 lambda 仅供直接构造 PeerManager 的测试便利；生产调用点（room）恒显式传入 getLastSeen
     const getLastSeen = opts.getLastSeen || ((ws) => ws?._lastSeen ?? ws?._connectedAt ?? null);
 
     const page = (items) => ({
@@ -866,7 +864,7 @@ export class PeerManager {
           const ageMs = now - (g.infoUpdatedAt.get(pid) ?? now);
           const reachable = connected || this._peerCenterReachable(g, pid, now);
           const isGhost = !connected && !reachable
-            && ageMs > (this.config.routeInfoUnreachableMs ?? 90_000);
+            && ageMs > this.config.routeInfoUnreachableMs;
           if (source === 'direct') direct += 1; else transit += 1;
           if (!connected) offline += 1;
           if (isGhost) ghost += 1;
@@ -949,7 +947,7 @@ export class PeerManager {
         if (g.infoSource.get(pid) === 'direct') routesDirect += 1; else routesTransit += 1;
         if (!g.peers.has(pid)
           && !this._peerCenterReachable(g, pid, now)
-          && now - (g.infoUpdatedAt.get(pid) ?? now) > (this.config.routeInfoUnreachableMs ?? 90_000)) {
+          && now - (g.infoUpdatedAt.get(pid) ?? now) > this.config.routeInfoUnreachableMs) {
           routesGhost += 1;
         }
       }
@@ -1071,10 +1069,22 @@ export class PeerManager {
         }
       }
     } catch (e) {
-      // 持久化数据损坏时静默丢弃，等待客户端重新同步
+      // 持久化数据损坏：丢弃全部持久化派生状态（身份/摘要/路由条目），等待客户端重新同步；
+      // 但必须保留 groups 里休眠唤醒时已登记的存活连接（peers/connVersions/sessions/peerCenter），
+      // 全清会让这些 socket 因 _peerId 已非空而无法重新握手，成为收不到转发的僵尸连接。
+      // 抛给上层（room._init 的 catch）感知并记录——此前静默吞掉，故障不可见。
       this.serverIdentity = null;
       this.digestRegistry.clear();
-      this.groups.clear();
+      for (const g of this.groups.values()) {
+        g.infos.clear();
+        g.rawInfos.clear();
+        g.infoSource.clear();
+        g.infoUpdatedAt.clear();
+        g.infoReporters.clear();
+        // 空分组计时归一（有存活连接的组不允许再被空组清扫）
+        g.emptySince = g.peers.size === 0 ? Date.now() : null;
+      }
+      throw e;
     }
   }
 }

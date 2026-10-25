@@ -74,7 +74,7 @@ function varintField(fieldNumber, value) {
 }
 
 /** 拼接多个 Uint8Array */
-export function concat(...parts) {
+function concat(...parts) {
   let total = 0;
   for (const p of parts) total += p.length;
   const out = new Uint8Array(total);
@@ -217,15 +217,4 @@ export function buildSyncRouteInfoRequestBytes(parts) {
     chunks.push(lenDelim(SYNC_REQ_FOREIGN_NETWORK, parts.foreignNetworkInfosBytes));
   }
   return concat(...chunks);
-}
-
-/**
- * 提取 SyncRouteInfoRequest 的 my_session_id（u64，BigInt）。
- * @returns {bigint|null}
- */
-export function extractMySessionId(syncReqBytes) {
-  const top = parseWireFields(syncReqBytes);
-  if (!top) return null;
-  const f = top.find((x) => x.fieldNumber === SYNC_REQ_MY_SESSION_ID);
-  return f ? (f.varint ?? 0n) : null;
 }

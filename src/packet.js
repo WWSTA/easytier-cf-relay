@@ -18,22 +18,21 @@ import { HEADER_SIZE } from './constants.js';
 /**
  * 解析 16 字节头。返回 null 表示数据不完整/非法。
  * @param {Uint8Array} buf
- * @param {number} [offset=0]
  */
-export function parseHeader(buf, offset = 0) {
-  if (!buf || buf.length - offset < HEADER_SIZE) return null;
-  const dv = new DataView(buf.buffer, buf.byteOffset + offset, HEADER_SIZE);
+export function parseHeader(buf) {
+  if (!buf || buf.length < HEADER_SIZE) return null;
+  const dv = new DataView(buf.buffer, buf.byteOffset, HEADER_SIZE);
   const header = {
     fromPeerId: dv.getUint32(0, true),
     toPeerId: dv.getUint32(4, true),
-    packetType: buf[offset + 8],
-    flags: buf[offset + 9],
-    forwardCounter: buf[offset + 10],
-    reserved: buf[offset + 11],
+    packetType: buf[8],
+    flags: buf[9],
+    forwardCounter: buf[10],
+    reserved: buf[11],
     len: dv.getUint32(12, true),
   };
   // len 与实际 payload 长度一致性校验（容忍多余填充，但不足则非法）
-  const payloadLen = buf.length - offset - HEADER_SIZE;
+  const payloadLen = buf.length - HEADER_SIZE;
   if (header.len > payloadLen) return null;
   return header;
 }
@@ -85,11 +84,11 @@ export function bumpForward(fullMessage, maxForwardCounter) {
 /**
  * 提取 payload 视图（不拷贝）。
  * len 传入 header.len 时按官方语义截断：len < 实际负载的
- * 部分视为填充，本地解析不再吞入填充字节；len 缺省或 >= 负载长度时行为不变。
+ * 部分视为填充，本地解析不再吞入填充字节；len >= 负载长度时行为不变。
  * 转发路径仍搬运完整原帧，透传不受影响。
  */
-export function payloadOf(buf, len = null) {
-  if (len == null || len < 0 || buf.length - HEADER_SIZE <= len) {
+export function payloadOf(buf, len) {
+  if (buf.length - HEADER_SIZE <= len) {
     return buf.subarray(HEADER_SIZE);
   }
   return buf.subarray(HEADER_SIZE, HEADER_SIZE + len);

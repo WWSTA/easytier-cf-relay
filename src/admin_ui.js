@@ -119,7 +119,6 @@ export const ADMIN_HTML = `<!doctype html>
   .masonry{position:relative; margin-bottom:14px}
   .masonry .card{position:absolute; margin:0; transition:left .18s ease, top .18s ease}
   .masonry.no-anim .card{transition:none}
-  .ov-hidden{display:none !important}
   .grid{display:grid; grid-template-columns:repeat(auto-fill,minmax(300px,1fr)); gap:14px; margin-bottom:14px}
   .card{background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); padding:14px 18px}
   .card-h{margin:0; font-size:13px; font-weight:600; color:var(--muted); cursor:pointer; user-select:none; display:flex; justify-content:space-between; align-items:center; gap:8px}
@@ -436,9 +435,10 @@ var REC_TYPE_NAMES = {
 };
 var BL_CAT_NAMES = { peer: '节点（PeerId）', group: '网络分组（网络名）', digest: '摘要注册（网络名）', socket: '连接（客户端 IP）' };
 var EVENT_LABELS = {
-  join: '加入', leave: '离开', replace: '顶替重连', kick: '踢出', reject: '拒绝',
+  join: '加入', leave: '离开', replace: '顶替重连',
   create: '创建', delete: '删除', register: '注册',
   add: '新增', remove: '移除', open: '打开', close: '关闭', error: '异常',
+  // expire/view：v1.3.0 前的历史记录类型，仅作旧数据展示兜底（无现役生产者），随留存窗口自然退役
   expire: '老化清除', login: '登录', view: '查看', op: '操作'
 };
 var REMOVE_REASONS = {
@@ -451,12 +451,15 @@ function $(id){ return document.getElementById(id); }
  * HTML 转义（文本 + 属性双上下文安全）。
  * 双引号一并转义为 &quot;，属性与文本两种位置均可安全使用。
  */
+// 只转义 < > & "（不转义单引号）——属性注入一律使用双引号是本文件的安全惯例
 function esc(s){ var d = document.createElement('div'); d.textContent = s == null ? '' : String(s); return d.innerHTML.replace(/"/g, '&quot;'); }
 function fmt(t){ return t ? new Date(t).toLocaleTimeString() : '-'; }
 function dur(ms){ if (ms == null) return '-'; var s = Math.floor(ms / 1000); if (s < 60) return s + 's'; if (s < 3600) return Math.floor(s / 60) + 'm' + (s % 60) + 's'; return Math.floor(s / 3600) + 'h' + Math.floor((s % 3600) / 60) + 'm'; }
 function toast(msg, isErr){ var t = $('toast'); t.textContent = msg; t.className = isErr ? 'err' : ''; t.style.display = 'block'; clearTimeout(t._h); t._h = setTimeout(function(){ t.style.display = 'none'; }, 3500); }
 function lsGet(k, d){ try { return localStorage.getItem(k) || d; } catch (e) { return d; } }
 function lsSet(k, v){ try { localStorage.setItem(k, v); } catch (e) { /* 隐私模式忽略 */ } }
+// 卡片收起状态读取（与收起点击处的 lsSet 写入成对：renderOverview 每 30s 重建时必须恢复）
+function cardCls(n){ return lsGet('et_admin_card_' + n) === '1' ? ' collapsed' : ''; }
 function fmtHM(t){ var d = new Date(t); return (d.getHours() < 10 ? '0' : '') + d.getHours() + ':' + (d.getMinutes() < 10 ? '0' : '') + d.getMinutes(); }
 
 function api(path, opts) {
@@ -959,7 +962,7 @@ function renderOverview(s) {
   var h = '';
   // 趋势卡：全宽、固定在卡片区最上方、不参与瀑布流（et_admin_ovcards.trend===false 时不渲染）
   if (ov.trend !== false) {
-    h += '<div class="card chartcard" id="card-trend">';
+    h += '<div class="card chartcard' + cardCls('trend') + '" id="card-trend">';
     h += '<h3 class="card-h" data-card="trend"><span>趋势 · ' + (TREND_WIN === '7d' ? '近 7 天' : '近 24 小时') + '（Analytics Engine）</span>' +
       '<span class="tabs" id="trend-tabs">' + trendTabsHtml() + '</span>' + CHEV + '</h3>';
     h += '<div class="card-b"><div class="chart-wrap" id="trend-body">' +
@@ -975,7 +978,7 @@ function renderOverview(s) {
     var quota = 100000;
     var pct = Math.min(100, Math.round(est / quota * 1000) / 10);
     var pctColor = pct >= 80 ? 'var(--bad)' : pct >= 50 ? 'var(--warn)' : 'var(--ok)';
-    h += '<div class="card" id="card-quota">';
+    h += '<div class="card' + cardCls('quota') + '" id="card-quota">';
     h += '<h3 class="card-h" data-card="quota"><span>额度观测（quota）</span>' + CHEV + '</h3>';
     h += '<div class="card-b">';
     h += '<div id="quota-real">' + (QUOTA_UNCONF ? unconfHintHtml('quota') : '') + '</div>';
@@ -992,7 +995,7 @@ function renderOverview(s) {
   }
   // 服务端
   if (ov.server !== false) {
-    h += '<div class="card" id="card-server">';
+    h += '<div class="card' + cardCls('server') + '" id="card-server">';
     h += '<h3 class="card-h" data-card="server"><span>服务端（node / status）</span>' + CHEV + '</h3>';
     h += '<div class="card-b">';
     h += kv('运行时长', dur(s.uptimeSec * 1000), null, UPTIME_TITLE);
@@ -1040,12 +1043,18 @@ function renderOverview(s) {
           '（MAX_ROUTES_PER_GROUP）上限，0 = 关闭。超限整帧拒绝（4009）或丢弃条目；' +
           '三条上限自洽（条目×字节 < 消息上限），合法全量推送不受影响');
       }
+      h += kv('网络名上限（字节）', s.config.maxNetworkNameBytes ?? '-');
+      h += kv('记录 / 黑名单上限', (s.config.recordDefaultLimit ?? '-') + ' / ' + (s.config.blacklistLimit ?? '-'));
+      h += kv('记录刷盘间隔（秒）', s.config.recordFlushMs != null ? Math.round(s.config.recordFlushMs / 1000) : '-');
+      h += kv('管理端审计', s.config.adminAudit ? ('开（上限 ' + (s.config.adminAuditLimit ?? '-') + '）') : '关');
+      h += kv('审计留存 / IP 打码', (s.config.auditRetentionDays ?? 0) + ' 天 / ' + (s.config.auditIpMask ? '开' : '关'));
+      h += kv('CF 脚本 / AE 数据集', (s.config.cfScriptName || '-') + ' / ' + (s.config.aeDataset || '-'));
     }
     h += '</div></div>';
   }
   // 统计
   if (ov.stats !== false) {
-    h += '<div class="card" id="card-stats">';
+    h += '<div class="card' + cardCls('stats') + '" id="card-stats">';
     h += '<h3 class="card-h" data-card="stats"><span>统计（stats）</span>' + CHEV + '</h3>';
     h += '<div class="card-b">';
     h += kv('累计连接', c.connsTotal);
@@ -1089,11 +1098,14 @@ function renderOverview(s) {
       '同网络名出现不同密钥摘要的握手被拒次数（疑似抢占堵门）。' +
       '攻击源见「记录查询 → 摘要注册」中的 squat-suspect 事件（含 IP，按网络名+IP 10 分钟去重），可拉黑。' +
       '计数随 DO 重启归零');
+    h += kv('落盘降级', c.flushDegraded || 0, (c.flushDegraded || 0) > 0 ? 'warn' : 'good',
+      '状态写回超预算的降级重试次数（丢 raw / 裁剪条目两档），持续增长说明路由状态体积异常；' +
+      '正常运行恒为 0。计数随 DO 重启归零');
     h += '</div></div>';
   }
   // 网络分组
   if (ov.groups !== false && st.groups) {
-    h += '<div class="card" id="card-groups">';
+    h += '<div class="card' + cardCls('groups') + '" id="card-groups">';
     h += '<h3 class="card-h" data-card="groups"><span>网络分组（foreign-network）</span>' + CHEV + '</h3>';
     h += '<div class="card-b">';
     h += kv('分组总数', st.groups.total);
@@ -1103,7 +1115,7 @@ function renderOverview(s) {
   }
   // 路由信息
   if (ov.routes !== false && st.routes) {
-    h += '<div class="card" id="card-routes">';
+    h += '<div class="card' + cardCls('routes') + '" id="card-routes">';
     h += '<h3 class="card-h" data-card="routes"><span>路由信息（route）</span>' + CHEV + '</h3>';
     h += '<div class="card-b">';
     h += kv('条目总数', st.routes.total);
@@ -1114,7 +1126,7 @@ function renderOverview(s) {
   }
   // 全局互联
   if (ov.peercenter !== false && st.peerCenter) {
-    h += '<div class="card" id="card-peercenter">';
+    h += '<div class="card' + cardCls('peercenter') + '" id="card-peercenter">';
     h += '<h3 class="card-h" data-card="peercenter"><span>全局互联（peer-center）</span>' + CHEV + '</h3>';
     h += '<div class="card-b">';
     h += kv('互联条目', st.peerCenter.total);
@@ -1122,7 +1134,7 @@ function renderOverview(s) {
   }
   // 摘要注册表
   if (ov.digests !== false && st.digests) {
-    h += '<div class="card" id="card-digests">';
+    h += '<div class="card' + cardCls('digests') + '" id="card-digests">';
     h += '<h3 class="card-h" data-card="digests"><span>摘要注册表</span>' + CHEV + '</h3>';
     h += '<div class="card-b">';
     h += kv('注册总数', st.digests.total);
@@ -1130,7 +1142,7 @@ function renderOverview(s) {
   }
   // 连接列表
   if (ov.sockets !== false && st.sockets) {
-    h += '<div class="card" id="card-sockets">';
+    h += '<div class="card' + cardCls('sockets') + '" id="card-sockets">';
     h += '<h3 class="card-h" data-card="sockets"><span>连接列表</span>' + CHEV + '</h3>';
     h += '<div class="card-b">';
     h += kv('当前连接', st.sockets.total);
@@ -1140,7 +1152,7 @@ function renderOverview(s) {
   }
   // 审计
   if (ov.audit !== false && st.audit) {
-    h += '<div class="card" id="card-audit">';
+    h += '<div class="card' + cardCls('audit') + '" id="card-audit">';
     h += '<h3 class="card-h" data-card="audit"><span>审计（KV 记录 + 黑名单）</span>' + CHEV + '</h3>';
     h += '<div class="card-b">';
     var rc = st.audit.records || {};
@@ -1236,8 +1248,12 @@ function unconfRecheck(kind) {
 }
 
 /* ---------------- AE 趋势（v1.6 A5+D2，双轴 + 悬停提示，纯 SVG 零图表库）----------------
- * 注意：本文件是模板字符串，页面内联 JS 里【不能用 \\'】（模板会把转义吃成裸引号，
- * 截断字符串导致整个脚本 SyntaxError）。onclick 传参一律走 data-* 属性。 */
+ * 本文件是模板字符串，页面内联 JS 三条纪律（改动前必读）：
+ * 1. 内联 JS 不能用 \\'（模板会把转义吃成裸引号 → 截断字符串 SyntaxError）；
+ * 2. 全文件禁止出现 $\{（模板插值：服务端 import 时即求值，引用服务端变量会静默
+ *    拼接进页面，页面编译守卫测试救不了）；
+ * 3. onclick 传参一律走 data-* 属性；unconfRecheck / setTrendWin 必须保持全局函数
+ *    （不得重构为闭包），将来补 CSP script-src 时这两处需豁免。 */
 function trendTabsHtml() {
   return '<button class="' + (TREND_WIN === '24h' ? 'on' : '') + '" data-win="24h" onclick="setTrendWin(this.dataset.win)">近 24h</button>' +
     '<button class="' + (TREND_WIN === '7d' ? 'on' : '') + '" data-win="7d" onclick="setTrendWin(this.dataset.win)">近 7 天</button>';
@@ -1380,7 +1396,7 @@ function layoutMasonry() {
   if (w <= 0) return;
   var cards = [];
   wrap.querySelectorAll(':scope > .card').forEach(function (card) {
-    if (!card.classList.contains('ov-hidden')) cards.push(card);
+    cards.push(card);
   });
   var gap = 14, minCol = 300;
   var cols = Math.max(1, Math.floor((w + gap) / (minCol + gap)));
@@ -1508,8 +1524,7 @@ function actLabel(act) {
   return {
     'del-group': '删除分组', 'kick': '踢出节点', 'del-route': '删除路由条目', 'del-pc': '删除互联条目',
     'close-sock': '断开连接', 'del-digest': '删除摘要注册', 'del-record': '删除记录', 'clear-records': '清空记录',
-    'bl-remove': '移除黑名单', 'bl-remove-one': '移除黑名单', 'bl-clear': '清空黑名单', 'bl-add': '加入黑名单',
-    'save-reccfg': '保存记录设置'
+    'bl-remove': '移除黑名单', 'bl-remove-one': '移除黑名单', 'bl-clear': '清空黑名单'
   }[act] || '操作';
 }
 

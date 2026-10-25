@@ -18,7 +18,10 @@
  */
 import {
   PacketType, HeaderFlags, MAX_FORWARD_COUNTER, MAGIC, VERSION,
-  SERVER_FEATURES, LIVENESS_ECHO_FEATURE, PERSIST_BUDGET_BYTES,
+  SERVER_FEATURES, LIVENESS_ECHO_FEATURE,
+  ROUTE_INFO_TTL_MS, ROUTE_INFO_UNREACHABLE_MS, GROUP_AUTO_DELETE_MS,
+  MAX_SYNC_ITEMS, MAX_ROUTE_INFO_BYTES, MAX_ROUTES_PER_GROUP, MAX_DIRECT_PEERS_REPORT,
+  FULL_RESYNC_COOLDOWN_MS, MAX_NETWORK_NAME_BYTES, WS_CLOSE,
 } from './constants.js';
 import { parseHeader, buildPacket, bumpForward, payloadOf } from './packet.js';
 import { PeerManager, resolveGroupKey } from './peer_manager.js';
@@ -33,6 +36,7 @@ const WS_OPEN = 1;
 const STATE_KEY = 'room_state';
 const BOOT_KEY = 'room_boot';
 const ATTACH_SYNC_INTERVAL_MS = 5000;
+const RETRY_AFTER_SEC = '60'; // 403/429 响应建议客户端退避时长（秒）
 
 // 账号级真实额度（v1.6.0 A6）：GraphQL Analytics API 查询结果的 DO storage 缓存
 const QUOTA_CACHE_KEY = 'quota_cache';
@@ -69,13 +73,20 @@ function intOrZero(env, key, def) {
 }
 
 export function buildConfig(env) {
+  // 启动期可感知的问题（如配置项解析失败）：由 RelayRoom 构造器在 logger 就绪后逐条 warn
+  const warnings = [];
   let networkSecrets = null;
   const raw = str(env, 'NETWORK_SECRETS', '');
   if (raw) {
     try {
       networkSecrets = JSON.parse(raw);
+      if (!networkSecrets || typeof networkSecrets !== 'object' || Array.isArray(networkSecrets)) {
+        networkSecrets = null;
+        warnings.push('NETWORK_SECRETS 不是 JSON 对象，已忽略：网络密钥校验不生效');
+      }
     } catch {
       networkSecrets = null;
+      warnings.push('NETWORK_SECRETS 不是合法 JSON（解析失败），已忽略：网络密钥校验不生效');
     }
   }
   // 趋势 SQL 的 AE 数据集名（须与 [[analytics_engine_datasets]] 的 dataset 一致；
@@ -83,12 +94,12 @@ export function buildConfig(env) {
   // 仅允许字母数字与 - _，非法值回退默认，防止拼坏 SQL
   const aeDataset = /^[A-Za-z0-9_-]+$/.test(str(env, 'AE_DATASET', ''))
     ? str(env, 'AE_DATASET', '')
-    : 'easytier_relay';
+    : 'easytier-cf-relay';
   return {
     serverPeerId: int(env, 'SERVER_PEER_ID', 10000001) >>> 0,
     serverNetworkName: str(env, 'SERVER_NETWORK_NAME', 'public_server'),
     serverHostname: str(env, 'SERVER_HOSTNAME', 'easytier-cf-relay'),
-    serverVersionStr: str(env, 'SERVER_VERSION_STR', 'easytier-cf-relay/1.6.1'),
+    serverVersionStr: str(env, 'SERVER_VERSION_STR', 'easytier-cf-relay/1.6.2'),
     avoidRelayData: bool(env, 'AVOID_RELAY_DATA', true),
     relayData: bool(env, 'RELAY_DATA', true),
     maxPeersPerRoom: int(env, 'MAX_PEERS_PER_ROOM', 64),
@@ -114,19 +125,19 @@ export function buildConfig(env) {
     logLevel: str(env, 'LOG_LEVEL', 'info'),
     networkSecrets,
     // 幽灵节点老化（官方 clear_expired_peer 语义，见 constants.js 注释）
-    routeInfoTtlMs: int(env, 'ROUTE_INFO_TTL_MS', 3_660_000),
-    routeInfoUnreachableMs: int(env, 'ROUTE_INFO_UNREACHABLE_MS', 90_000),
+    routeInfoTtlMs: int(env, 'ROUTE_INFO_TTL_MS', ROUTE_INFO_TTL_MS),
+    routeInfoUnreachableMs: int(env, 'ROUTE_INFO_UNREACHABLE_MS', ROUTE_INFO_UNREACHABLE_MS),
     // 空分组自动删除宽限（0 = 关闭）
-    groupAutoDeleteMs: intOrZero(env, 'GROUP_AUTO_DELETE_MS', 60_000),
+    groupAutoDeleteMs: intOrZero(env, 'GROUP_AUTO_DELETE_MS', GROUP_AUTO_DELETE_MS),
     // ---- 资源滥用防线（语义见 constants.js；0 = 关闭该防线）----
     // 上限自洽不变量：maxRoutesPerGroup × maxRouteInfoBytes < maxMessageBytes，
     // 违反时构造函数日志 warn（合法全量推送可能被出站硬闸丢弃）。
-    maxSyncItems: intOrZero(env, 'MAX_SYNC_ITEMS', 256),
-    maxRouteInfoBytes: intOrZero(env, 'MAX_ROUTE_INFO_BYTES', 768),
-    maxRoutesPerGroup: intOrZero(env, 'MAX_ROUTES_PER_GROUP', 128),
-    maxDirectPeersReport: intOrZero(env, 'MAX_DIRECT_PEERS_REPORT', 64),
-    fullResyncCooldownMs: intOrZero(env, 'FULL_RESYNC_COOLDOWN_MS', 1000),
-    maxNetworkNameBytes: intOrZero(env, 'MAX_NETWORK_NAME_BYTES', 128),
+    maxSyncItems: intOrZero(env, 'MAX_SYNC_ITEMS', MAX_SYNC_ITEMS),
+    maxRouteInfoBytes: intOrZero(env, 'MAX_ROUTE_INFO_BYTES', MAX_ROUTE_INFO_BYTES),
+    maxRoutesPerGroup: intOrZero(env, 'MAX_ROUTES_PER_GROUP', MAX_ROUTES_PER_GROUP),
+    maxDirectPeersReport: intOrZero(env, 'MAX_DIRECT_PEERS_REPORT', MAX_DIRECT_PEERS_REPORT),
+    fullResyncCooldownMs: intOrZero(env, 'FULL_RESYNC_COOLDOWN_MS', FULL_RESYNC_COOLDOWN_MS),
+    maxNetworkNameBytes: intOrZero(env, 'MAX_NETWORK_NAME_BYTES', MAX_NETWORK_NAME_BYTES),
     // ---- KV 审计（记录 / 黑名单）----
     recordFlushMs: int(env, 'RECORD_FLUSH_MS', 600_000),
     recordDefaultLimit: int(env, 'RECORD_DEFAULT_LIMIT', 100),
@@ -147,6 +158,7 @@ export function buildConfig(env) {
     cfApiToken: str(env, 'CF_API_TOKEN', ''),
     cfScriptName: str(env, 'CF_SCRIPT_NAME', 'easytier-cf-relay'),
     aeDataset,
+    warnings,
   };
 }
 
@@ -171,6 +183,7 @@ export class RelayRoom {
     this.env = env;
     this.config = buildConfig(env);
     this.log = makeLogger(this.config.logLevel);
+    for (const w of this.config.warnings || []) this.log.warn(w);
     // 上限自洽检查（资源滥用防线，见 constants.js 注释）：仅提醒不阻断，
     // 防止运维改大条目上限后合法全量推送被出站硬闸误丢
     if (this.config.maxRoutesPerGroup > 0 && this.config.maxRouteInfoBytes > 0
@@ -371,10 +384,9 @@ export class RelayRoom {
     }
     // KV 审计：删除记录（admin 类为硬审计不可删；type=all 按 id 跨类型删除）
     if (path === '/internal/records/delete' && request.method === 'POST') {
-      const body = await request.json().catch(() => ({}));
+      const body = await this._readBody(request);
       const r = this.audit.deleteRecords(body.type, body.ids);
-      this.audit.adminTouch(adminIp, 'op', { action: 'records-delete', type: body.type, removed: r.removed || 0 });
-      await this.audit.flush(Date.now(), { forceKv: true });
+      await this._adminOp(adminIp, 'records-delete', { type: body.type, removed: r.removed || 0 });
       return Response.json(r);
     }
     // KV 审计：记录配置（每类开关 + 上限；admin 类为硬设置不可改）
@@ -382,10 +394,9 @@ export class RelayRoom {
       return Response.json({ ok: true, ...this.audit.getConfig() });
     }
     if (path === '/internal/record/config' && request.method === 'POST') {
-      const body = await request.json().catch(() => ({}));
+      const body = await this._readBody(request);
       const r = this.audit.setConfig(body.types);
-      this.audit.adminTouch(adminIp, 'op', { action: 'record-config' });
-      await this.audit.flush(Date.now(), { forceKv: true });
+      await this._adminOp(adminIp, 'record-config');
       return Response.json(r);
     }
     // 黑名单：查询（cat ∈ peer|group|digest|socket）
@@ -401,55 +412,49 @@ export class RelayRoom {
     }
     // 黑名单：手工添加
     if (path === '/internal/blacklist/add' && request.method === 'POST') {
-      const body = await request.json().catch(() => ({}));
+      const body = await this._readBody(request);
       const r = this.audit.blacklistAdd(body.cat, body.value, { reason: body.reason });
-      this.audit.adminTouch(adminIp, 'op', { action: 'blacklist-add', cat: body.cat, value: body.value });
-      await this.audit.flush(Date.now(), { forceKv: true });
+      await this._adminOp(adminIp, 'blacklist-add', { cat: body.cat, value: body.value });
       return Response.json(r);
     }
     // 黑名单：移除（解除封锁）
     if (path === '/internal/blacklist/delete' && request.method === 'POST') {
-      const body = await request.json().catch(() => ({}));
+      const body = await this._readBody(request);
       const r = this.audit.blacklistRemove(body.cat, body.ids);
-      this.audit.adminTouch(adminIp, 'op', { action: 'blacklist-remove', cat: body.cat, removed: r.removed || 0 });
-      await this.audit.flush(Date.now(), { forceKv: true });
+      await this._adminOp(adminIp, 'blacklist-remove', { cat: body.cat, removed: r.removed || 0 });
       return Response.json(r);
     }
     if (path === '/internal/group/delete' && request.method === 'POST') {
-      const body = await request.json().catch(() => ({}));
+      const body = await this._readBody(request);
       // _deleteGroups 为 async（需落盘），必须 await，否则 Promise 被序列化为 {}
       return Response.json(await this._deleteGroups(body, adminIp));
     }
     if (path === '/internal/peer/kick' && request.method === 'POST') {
-      const body = await request.json().catch(() => ({}));
+      const body = await this._readBody(request);
       const r = this._kickPeers(body);
-      this.audit.adminTouch(adminIp, 'op', { action: 'peer-kick', kicked: (r.kicked || []).length });
-      await this.audit.flush(Date.now(), { forceKv: true });
+      await this._adminOp(adminIp, 'peer-kick', { kicked: (r.kicked || []).length });
       return Response.json(r);
     }
     if (path === '/internal/route/delete' && request.method === 'POST') {
-      const body = await request.json().catch(() => ({}));
+      const body = await this._readBody(request);
       const r = this._deleteRouteInfos(body);
-      this.audit.adminTouch(adminIp, 'op', { action: 'route-delete', removed: (r.removed || []).length });
-      await this.audit.flush(Date.now(), { forceKv: true });
+      await this._adminOp(adminIp, 'route-delete', { removed: (r.removed || []).length });
       return Response.json(r);
     }
     if (path === '/internal/digest/delete' && request.method === 'POST') {
-      const body = await request.json().catch(() => ({}));
+      const body = await this._readBody(request);
       return Response.json(await this._deleteDigests(body, adminIp));
     }
     if (path === '/internal/peercenter/delete' && request.method === 'POST') {
-      const body = await request.json().catch(() => ({}));
+      const body = await this._readBody(request);
       const r = this._deletePeerCenter(body);
-      this.audit.adminTouch(adminIp, 'op', { action: 'peercenter-delete', removed: (r.removed || []).length });
-      await this.audit.flush(Date.now(), { forceKv: true });
+      await this._adminOp(adminIp, 'peercenter-delete', { removed: (r.removed || []).length });
       return Response.json(r);
     }
     if (path === '/internal/socket/close' && request.method === 'POST') {
-      const body = await request.json().catch(() => ({}));
+      const body = await this._readBody(request);
       const r = this._closeSockets(body);
-      this.audit.adminTouch(adminIp, 'op', { action: 'socket-close', closed: (r.closed || []).length });
-      await this.audit.flush(Date.now(), { forceKv: true });
+      await this._adminOp(adminIp, 'socket-close', { closed: (r.closed || []).length });
       return Response.json(r);
     }
 
@@ -471,7 +476,7 @@ export class RelayRoom {
         this.log.warn(`connection rejected (ip blacklist): ip=${clientIp}`);
         return new Response('Forbidden', {
           status: 403,
-          headers: { 'retry-after': '60' }, // 建议客户端退避重试
+          headers: { 'retry-after': RETRY_AFTER_SEC }, // 建议客户端退避重试
         });
       }
     }
@@ -492,7 +497,7 @@ export class RelayRoom {
         this.log.warn(`connection rejected (per-ip limit): ip=${clientIp} open=${same}`);
         return new Response('Too many connections', {
           status: 429,
-          headers: { 'retry-after': '60' },
+          headers: { 'retry-after': RETRY_AFTER_SEC },
         });
       }
     }
@@ -501,6 +506,11 @@ export class RelayRoom {
     const [client, server] = [pair[0], pair[1]];
     this._acceptSocket(server, clientIp);
     return new Response(null, { status: 101, webSocket: client });
+  }
+
+  /** 读取 JSON 请求体（解析失败回退空对象——管理端薄路由的既有约定） */
+  async _readBody(request) {
+    return request.json().catch(() => ({}));
   }
 
   // -------------------------------------------------------------------
@@ -646,7 +656,7 @@ export class RelayRoom {
         this.log.warn(
           `rate limit exceeded: peer=${ws._peerId} count=${ws._rateCount}/${this.config.msgRateLimitPerSec}/s`
         );
-        this._close(ws, 4008, 'rate limited');
+        this._close(ws, WS_CLOSE.RATE_LIMITED, 'rate limited');
         this._cleanupPeer(ws, 'rate-limited');
         return;
       }
@@ -654,7 +664,7 @@ export class RelayRoom {
 
     if (buf.length > this.config.maxMessageBytes) {
       this.log.warn(`oversized message (${buf.length}) from socket, closing`);
-      this._close(ws, 4009, 'oversized');
+      this._close(ws, WS_CLOSE.OVERSIZED, 'oversized');
       return;
     }
 
@@ -662,7 +672,7 @@ export class RelayRoom {
     if (!header) {
       this.log.warn(`malformed packet (len=${buf.length})`);
       this.counters.errors += 1;
-      this._close(ws, 4002, 'malformed');
+      this._close(ws, WS_CLOSE.MALFORMED, 'malformed');
       return;
     }
 
@@ -742,7 +752,7 @@ export class RelayRoom {
         // secure-mode（Noise）为官方较新的可选功能，本中继不支持；
         // 客户端需以普通模式连接（默认配置即为普通握手 + 可选 AES-GCM 透传）。
         this.log.info(`secure-mode handshake (type=${header.packetType}) not supported, closing`);
-        this._close(ws, 4003, 'secure mode unsupported');
+        this._close(ws, WS_CLOSE.UNSUPPORTED, 'secure mode unsupported');
         return;
       default:
         // ForeignNetworkPacket / Relay* / deprecated 类型：原样转发
@@ -782,20 +792,20 @@ export class RelayRoom {
       req = this.types.HandshakeRequest.decode(payload);
     } catch (e) {
       this.log.warn(`handshake decode failed: ${e.message}`);
-      this._close(ws, 4002, 'bad handshake');
+      this._close(ws, WS_CLOSE.MALFORMED, 'bad handshake');
       return;
     }
     if (Number(req.magic) !== MAGIC) {
-      this._close(ws, 4002, 'bad magic');
+      this._close(ws, WS_CLOSE.MALFORMED, 'bad magic');
       return;
     }
     if (Number(req.version) !== VERSION) {
-      this._close(ws, 4002, 'bad version');
+      this._close(ws, WS_CLOSE.MALFORMED, 'bad version');
       return;
     }
     const peerId = Number(req.myPeerId);
     if (!Number.isInteger(peerId) || peerId <= 0 || peerId === this.config.serverPeerId) {
-      this._close(ws, 4002, 'bad peer id');
+      this._close(ws, WS_CLOSE.MALFORMED, 'bad peer id');
       return;
     }
 
@@ -809,7 +819,7 @@ export class RelayRoom {
       this.log.warn(
         `handshake rejected: bad network name (len=${networkName.length}) peer=${peerId}`
       );
-      this._close(ws, 4002, 'bad network name');
+      this._close(ws, WS_CLOSE.MALFORMED, 'bad network name');
       return;
     }
 
@@ -825,7 +835,7 @@ export class RelayRoom {
         this.log.warn(
           `handshake rejected (blacklist:${bl.cat}) network="${networkName}" peer=${peerId} value=${bl.value}`
         );
-        this._close(ws, 4013, 'blacklisted');
+        this._close(ws, WS_CLOSE.BLACKLISTED, 'blacklisted');
         return;
       }
     }
@@ -847,7 +857,7 @@ export class RelayRoom {
         digest: digestHex.slice(0, 16),
         ...(ws._clientIp ? { ip: ws._clientIp } : {}),
       });
-      this._close(ws, 4003, 'digest mismatch');
+      this._close(ws, WS_CLOSE.UNSUPPORTED, 'digest mismatch');
       return;
     }
     const groupKey = resolved.groupKey;
@@ -858,7 +868,7 @@ export class RelayRoom {
     if (this.pm.totalPeers() >= this.config.maxPeersPerRoom) {
       const existing = this.pm.getPeer(groupKey, peerId);
       if (!existing) {
-        this._close(ws, 4029, 'room full');
+        this._close(ws, WS_CLOSE.ROOM_FULL, 'room full');
         return;
       }
     }
@@ -873,7 +883,7 @@ export class RelayRoom {
         this.log.warn(
           `handshake rejected: group full network="${networkName}" peers=${g.peers.size}/${this.config.maxPeersPerGroup}`
         );
-        this._close(ws, 4030, 'group full');
+        this._close(ws, WS_CLOSE.GROUP_FULL, 'group full');
         return;
       }
     }
@@ -892,9 +902,7 @@ export class RelayRoom {
     const isReplace = !!(prior && prior !== ws);
     if (isReplace) {
       this.log.info(`peer=${peerId} reconnected, closing stale socket`);
-      try {
-        prior.close(4000, 'replaced');
-      } catch { /* ignore */ }
+      this._close(prior, WS_CLOSE.REPLACED, 'replaced');
       this._cleanupPeer(prior, 'replaced');
     }
     this.pm.addPeer(groupKey, peerId, ws);
@@ -1011,6 +1019,17 @@ export class RelayRoom {
     } catch { /* ignore */ }
   }
 
+  /** 当前 socket 汇总计数（连接列表 / 总览 / stats 共用同一口径） */
+  _socketCounts() {
+    let total = 0;
+    let handshaked = 0;
+    for (const ws of this.state.getWebSockets()) {
+      total += 1;
+      if (ws._peerId != null) handshaked += 1;
+    }
+    return { total, handshaked, pending: total - handshaked };
+  }
+
   _cleanupPeer(ws, cause) {
     if (ws._peerId == null || ws._groupKey == null) return;
     const { _peerId: peerId, _groupKey: groupKey, _networkName: networkName } = ws;
@@ -1112,7 +1131,7 @@ export class RelayRoom {
         const connectedAt = this._loadAttachment(ws).connectedAt ?? now;
         if (now - connectedAt > cfg.handshakeTimeoutMs) {
           this.log.info('closing un-handshaked socket (timeout)');
-          this._close(ws, 4001, 'handshake timeout');
+          this._close(ws, WS_CLOSE.TIMEOUT, 'handshake timeout');
         }
         continue;
       }
@@ -1120,7 +1139,7 @@ export class RelayRoom {
       // 防线 b：空闲超时（超过客户端最大 ping 间隔 32s 的安全余量）
       if (now - lastSeen > cfg.peerIdleTimeoutMs) {
         this.log.info(`peer=${ws._peerId} idle timeout, closing`);
-        this._close(ws, 4001, 'idle timeout');
+        this._close(ws, WS_CLOSE.TIMEOUT, 'idle timeout');
         this._cleanupPeer(ws, 'idle-timeout');
         continue;
       }
@@ -1227,7 +1246,6 @@ export class RelayRoom {
 
   async _flushState() {
     this._storageFlushAt = Date.now();
-    this._dirty = false;
     // 落盘预算降级：DO storage 单值上限 128 KiB。raw 字节
     // 以 JSON 数字数组持久化（4-5× 膨胀），被注入的巨型状态曾估算可超限——
     // 超限后每次 flush 白写（浪费存储写入）、重启丢状态。失败即降级重试
@@ -1235,19 +1253,19 @@ export class RelayRoom {
     try {
       try {
         await this.state.storage.put(STATE_KEY, this.pm.toPersisted());
-        return;
       } catch (e1) {
         this.counters.flushDegraded += 1;
         this.log.warn(`flush state over budget, retrying without raw bytes: ${e1.message}`);
+        try {
+          await this.state.storage.put(STATE_KEY, this.pm.toPersisted({ dropRaw: true }));
+        } catch (e2) {
+          this.counters.flushDegraded += 1;
+          this.log.warn(`flush state still over budget, trimming oldest entries: ${e2.message}`);
+          await this.state.storage.put(STATE_KEY, this.pm.toPersisted({ dropRaw: true, trimEntries: 16 }));
+        }
       }
-      try {
-        await this.state.storage.put(STATE_KEY, this.pm.toPersisted({ dropRaw: true }));
-        return;
-      } catch (e2) {
-        this.counters.flushDegraded += 1;
-        this.log.warn(`flush state still over budget, trimming oldest entries: ${e2.message}`);
-      }
-      await this.state.storage.put(STATE_KEY, this.pm.toPersisted({ dropRaw: true, trimEntries: 16 }));
+      // 仅在写盘成功后复位——三档全失败时保留脏标记，下个 alarm 自动重试
+      this._dirty = false;
     } catch (e) {
       this.log.warn(`flush state failed: ${e.message}`);
     }
@@ -1256,6 +1274,60 @@ export class RelayRoom {
   // -------------------------------------------------------------------
   // 管理端操作（由 Worker 入口鉴权后经 /internal/* 调用）
   // -------------------------------------------------------------------
+
+  /**
+   * /internal/state 与 /internal/stats 共用的配置视图。
+   * 白名单式输出——cfApiToken 等敏感项绝不进入（cfAccountId 亦不列出）。
+   */
+  _configView() {
+    const c = this.config;
+    return {
+      // —— 既有对外字段（顺序与语义保持不变）——
+      serverHostname: c.serverHostname,
+      serverVersionStr: c.serverVersionStr,
+      serverNetworkName: c.serverNetworkName,
+      avoidRelayData: c.avoidRelayData,
+      relayData: c.relayData,
+      strictDigest: c.strictDigest,
+      maxPeersPerRoom: c.maxPeersPerRoom,
+      maxPeersPerGroup: c.maxPeersPerGroup,
+      maxConnsPerIp: c.maxConnsPerIp,
+      maxMessageBytes: c.maxMessageBytes,
+      msgRateLimitPerSec: c.msgRateLimitPerSec,
+      handshakeTimeoutMs: c.handshakeTimeoutMs,
+      peerIdleTimeoutMs: c.peerIdleTimeoutMs,
+      serverPingIdleMs: c.serverPingIdleMs,
+      sweepIntervalMs: c.sweepIntervalMs,
+      sweepIdleIntervalMs: c.sweepIdleIntervalMs,
+      digestValidation: !!c.networkSecrets,
+      routeInfoTtlMs: c.routeInfoTtlMs,
+      routeInfoUnreachableMs: c.routeInfoUnreachableMs,
+      groupAutoDeleteMs: c.groupAutoDeleteMs,
+      // 资源滥用防线
+      maxSyncItems: c.maxSyncItems,
+      maxRouteInfoBytes: c.maxRouteInfoBytes,
+      maxRoutesPerGroup: c.maxRoutesPerGroup,
+      maxDirectPeersReport: c.maxDirectPeersReport,
+      fullResyncCooldownMs: c.fullResyncCooldownMs,
+      // —— v1.6.2 补齐：协议与运维参数此前不可见 ——
+      maxNetworkNameBytes: c.maxNetworkNameBytes,
+      recordFlushMs: c.recordFlushMs,
+      recordDefaultLimit: c.recordDefaultLimit,
+      blacklistLimit: c.blacklistLimit,
+      adminAudit: c.adminAudit,
+      adminAuditLimit: c.adminAuditLimit,
+      auditIpMask: c.auditIpMask,
+      auditRetentionDays: c.auditRetentionDays,
+      cfScriptName: c.cfScriptName,
+      aeDataset: c.aeDataset,
+    };
+  }
+
+  /** 管理端操作收尾：审计记录 + 强制刷盘（管理操作低频，每次 1 次 KV 写） */
+  async _adminOp(adminIp, action, meta = {}) {
+    this.audit.adminTouch(adminIp, 'op', { action, ...meta });
+    await this.audit.flush(Date.now(), { forceKv: true });
+  }
 
   /**
    * 分页状态快照（管理端按 tab 拉取；sockets tab 由本层处理，其余委托 pm）。
@@ -1270,9 +1342,7 @@ export class RelayRoom {
     let snap;
     if (tab === 'sockets') {
       const items = [];
-      let handshaked = 0;
       for (const ws of this.state.getWebSockets()) {
-        if (ws._peerId != null) handshaked += 1;
         items.push({
           socketId: ws._socketId ?? null,
           peerId: ws._peerId ?? null,
@@ -1290,7 +1360,7 @@ export class RelayRoom {
         offset,
         limit,
         items: items.slice(offset, offset + limit),
-        stats: { total: items.length, handshaked, pending: items.length - handshaked },
+        stats: this._socketCounts(),
       };
     } else {
       snap = this.pm.snapshotState({
@@ -1303,14 +1373,8 @@ export class RelayRoom {
     }
     // 总览补充：连接列表统计（侧边栏计数）+ 审计（记录/黑名单）概览
     if (tab === 'overview') {
-      let socketsTotal = 0;
-      let socketsHandshaked = 0;
-      for (const ws of this.state.getWebSockets()) {
-        socketsTotal += 1;
-        if (ws._peerId != null) socketsHandshaked += 1;
-      }
       snap.stats = snap.stats || {};
-      snap.stats.sockets = { total: socketsTotal, handshaked: socketsHandshaked };
+      snap.stats.sockets = this._socketCounts();
       snap.stats.audit = {
         records: this.audit._counts(),
         blacklist: this.audit.blacklistCounts(),
@@ -1324,34 +1388,7 @@ export class RelayRoom {
       uptimeSec: Math.floor((Date.now() - this.startedAt) / 1000),
       serverPeerId: this.config.serverPeerId,
       counters: this.counters,
-      config: {
-        serverHostname: this.config.serverHostname,
-        serverVersionStr: this.config.serverVersionStr,
-        serverNetworkName: this.config.serverNetworkName,
-        avoidRelayData: this.config.avoidRelayData,
-        relayData: this.config.relayData,
-        strictDigest: this.config.strictDigest,
-        maxPeersPerRoom: this.config.maxPeersPerRoom,
-        maxPeersPerGroup: this.config.maxPeersPerGroup,
-        maxConnsPerIp: this.config.maxConnsPerIp,
-        maxMessageBytes: this.config.maxMessageBytes,
-        msgRateLimitPerSec: this.config.msgRateLimitPerSec,
-        handshakeTimeoutMs: this.config.handshakeTimeoutMs,
-        peerIdleTimeoutMs: this.config.peerIdleTimeoutMs,
-        serverPingIdleMs: this.config.serverPingIdleMs,
-        sweepIntervalMs: this.config.sweepIntervalMs,
-        sweepIdleIntervalMs: this.config.sweepIdleIntervalMs,
-        digestValidation: !!this.config.networkSecrets,
-        routeInfoTtlMs: this.config.routeInfoTtlMs,
-        routeInfoUnreachableMs: this.config.routeInfoUnreachableMs,
-        groupAutoDeleteMs: this.config.groupAutoDeleteMs,
-        // 资源滥用防线
-        maxSyncItems: this.config.maxSyncItems,
-        maxRouteInfoBytes: this.config.maxRouteInfoBytes,
-        maxRoutesPerGroup: this.config.maxRoutesPerGroup,
-        maxDirectPeersReport: this.config.maxDirectPeersReport,
-        fullResyncCooldownMs: this.config.fullResyncCooldownMs,
-      },
+      config: this._configView(),
     };
   }
 
@@ -1390,7 +1427,7 @@ export class RelayRoom {
       for (const ws of this.state.getWebSockets()) {
         if (ws._groupKey === gk) {
           this._cleanupPeer(ws, 'group-deleted');
-          try { ws.close(4010, 'group deleted'); } catch { /* ignore */ }
+          this._close(ws, WS_CLOSE.GROUP_DELETED, 'group deleted');
           closed += 1;
         }
       }
@@ -1407,8 +1444,7 @@ export class RelayRoom {
       this._dirty = true;
       await this._flushState();
     }
-    this.audit.adminTouch(adminIp, 'op', { action: 'group-delete', count: deleted.length });
-    await this.audit.flush(Date.now(), { forceKv: true });
+    await this._adminOp(adminIp, 'group-delete', { count: deleted.length });
     return { ok: true, deleted };
   }
 
@@ -1435,7 +1471,7 @@ export class RelayRoom {
       const ws = this.pm.getPeer(groupKey, peerId);
       if (!ws) { notFound.push({ groupKey, peerId }); continue; }
       this._cleanupPeer(ws, 'kicked');
-      try { ws.close(4008, 'kicked'); } catch { /* ignore */ }
+      this._close(ws, WS_CLOSE.KICKED, 'kicked');
       // 黑名单（peer 类）：该 PeerId 后续握手被拒
       this.audit.blacklistAdd('peer', peerId, { reason: 'kicked by admin', groupKey });
       kicked.push({ groupKey, peerId });
@@ -1493,7 +1529,7 @@ export class RelayRoom {
       for (const ws of this.state.getWebSockets()) {
         if (ws._groupKey == null || !clearedGroupKeys.has(ws._groupKey)) continue;
         this._cleanupPeer(ws, 'digest-deleted');
-        try { ws.close(4011, 'digest deleted'); } catch { /* ignore */ }
+        this._close(ws, WS_CLOSE.DIGEST_DELETED, 'digest deleted');
         closedTotal += 1;
       }
     }
@@ -1502,8 +1538,7 @@ export class RelayRoom {
       await this._flushState();
       this.log.info(`admin: digests deleted names=[${networkNames.join(',')}] closed=${closedTotal}`);
     }
-    this.audit.adminTouch(adminIp, 'op', { action: 'digest-delete', count: networkNames.length });
-    await this.audit.flush(Date.now(), { forceKv: true });
+    await this._adminOp(adminIp, 'digest-delete', { count: networkNames.length });
     return { ok: true, ...r, closedPeers: closedTotal };
   }
 
@@ -1548,7 +1583,7 @@ export class RelayRoom {
         });
       }
       this._cleanupPeer(ws, 'admin-closed');
-      try { ws.close(4012, 'closed by admin'); } catch { /* ignore */ }
+      this._close(ws, WS_CLOSE.ADMIN_CLOSED, 'closed by admin');
       closed.push(id);
       const idx = notFound.indexOf(id);
       if (idx >= 0) notFound.splice(idx, 1);
@@ -1571,12 +1606,6 @@ export class RelayRoom {
       };
     }
     // 连接列表统计（v1.6.0 补齐：此前 JSON 只含 peers/groups 总数）
-    let socketsTotal = 0;
-    let socketsHandshaked = 0;
-    for (const ws of this.state.getWebSockets()) {
-      socketsTotal += 1;
-      if (ws._peerId != null) socketsHandshaked += 1;
-    }
     return {
       ok: true,
       startedAt: this.startedAt,
@@ -1586,41 +1615,14 @@ export class RelayRoom {
       groupCount: this.pm.groupCount(),
       groups,
       counters: this.counters,
-      sockets: { total: socketsTotal, handshaked: socketsHandshaked, pending: socketsTotal - socketsHandshaked },
+      sockets: this._socketCounts(),
       audit: {
         kvEnabled: !!this.audit.kv,
         records: this.audit._counts(),
         blacklist: this.audit.blacklistCounts(),
       },
       // v1.6.0：config 对齐管理端白名单（此前仅 6 项，落后多个版本）
-      config: {
-        serverHostname: this.config.serverHostname,
-        serverVersionStr: this.config.serverVersionStr,
-        serverNetworkName: this.config.serverNetworkName,
-        avoidRelayData: this.config.avoidRelayData,
-        relayData: this.config.relayData,
-        strictDigest: this.config.strictDigest,
-        maxPeersPerRoom: this.config.maxPeersPerRoom,
-        maxPeersPerGroup: this.config.maxPeersPerGroup,
-        maxConnsPerIp: this.config.maxConnsPerIp,
-        maxMessageBytes: this.config.maxMessageBytes,
-        msgRateLimitPerSec: this.config.msgRateLimitPerSec,
-        handshakeTimeoutMs: this.config.handshakeTimeoutMs,
-        peerIdleTimeoutMs: this.config.peerIdleTimeoutMs,
-        serverPingIdleMs: this.config.serverPingIdleMs,
-        sweepIntervalMs: this.config.sweepIntervalMs,
-        sweepIdleIntervalMs: this.config.sweepIdleIntervalMs,
-        digestValidation: !!this.config.networkSecrets,
-        routeInfoTtlMs: this.config.routeInfoTtlMs,
-        routeInfoUnreachableMs: this.config.routeInfoUnreachableMs,
-        groupAutoDeleteMs: this.config.groupAutoDeleteMs,
-        // 资源滥用防线
-        maxSyncItems: this.config.maxSyncItems,
-        maxRouteInfoBytes: this.config.maxRouteInfoBytes,
-        maxRoutesPerGroup: this.config.maxRoutesPerGroup,
-        maxDirectPeersReport: this.config.maxDirectPeersReport,
-        fullResyncCooldownMs: this.config.fullResyncCooldownMs,
-      },
+      config: this._configView(),
     };
   }
 
@@ -1659,6 +1661,17 @@ export class RelayRoom {
     return Response.json({ ok: true, ...result, cached: false });
   }
 
+  /** 带超时的出站 fetch（额度查询 5s / AE 查询 8s 共用）：超时 abort，调用方负责解析响应 */
+  async _fetchWithTimeout(url, init, timeoutMs) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    try {
+      return await fetch(url, { ...init, signal: ctrl.signal });
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   /** 出站调 Cloudflare GraphQL Analytics API（出站调用不消耗 100k 入站请求额度） */
   async _fetchQuota(account, token, now) {
     const untilDate = new Date(now);
@@ -1677,10 +1690,8 @@ export class RelayRoom {
         ) { dimensions { datetimeHour } sum { requests subrequests errors } }
       } }
     }`;
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 5000);
     try {
-      const res = await fetch('https://api.cloudflare.com/client/v4/graphql', {
+      const res = await this._fetchWithTimeout('https://api.cloudflare.com/client/v4/graphql', {
         method: 'POST',
         headers: { Authorization: `Bearer ${token}`, 'content-type': 'application/json' },
         body: JSON.stringify({
@@ -1692,8 +1703,7 @@ export class RelayRoom {
             until: untilDate.toISOString(),
           },
         }),
-        signal: ctrl.signal,
-      });
+      }, 5000);
       const j = await res.json();
       if (!res.ok || (j.errors && j.errors.length)) {
         const msg = (j.errors && j.errors[0] && j.errors[0].message) || `HTTP ${res.status}`;
@@ -1721,8 +1731,6 @@ export class RelayRoom {
       };
     } catch (e) {
       return { source: 'unavailable', error: String((e && e.message) || e).slice(0, 200), fetchedAt: now };
-    } finally {
-      clearTimeout(timer);
     }
   }
 
@@ -1918,25 +1926,18 @@ export class RelayRoom {
 
   /** 执行 AE SQL 查询并解析 JSON 响应（响应 {meta,data} 或顶层数组，返回 data 行对象，按列名取数） */
   async _aeSqlQuery(token, url, sql) {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 8000);
-    try {
-      const res = await fetch(url, {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${token}`, 'content-type': 'text/plain' },
-        body: sql,
-        signal: ctrl.signal,
-      });
-      if (!res.ok) {
-        const body = await res.text().catch(() => '');
-        throw new Error(`ae sql HTTP ${res.status}: ${String(body).replace(/\s+/g, ' ').slice(0, 160)}`);
-      }
-      const j = await res.json();
-      if (Array.isArray(j)) return j; // 防御：JSONEachRow 形状（顶层数组）
-      return j && Array.isArray(j.data) ? j.data : [];
-    } finally {
-      clearTimeout(timer);
+    const res = await this._fetchWithTimeout(url, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'content-type': 'text/plain' },
+      body: sql,
+    }, 8000);
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      throw new Error(`ae sql HTTP ${res.status}: ${String(body).replace(/\s+/g, ' ').slice(0, 160)}`);
     }
+    const j = await res.json();
+    if (Array.isArray(j)) return j; // 防御：JSONEachRow 形状（顶层数组）
+    return j && Array.isArray(j.data) ? j.data : [];
   }
 }
 

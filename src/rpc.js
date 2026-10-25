@@ -15,7 +15,7 @@
  * - SyncRouteInfoRequest 出站走 wire 层重组（wire.js），逐字节保留对端上报的
  *   RoutePeerInfo 原始内容（对齐官方 route_peer_wire.rs raw_peer_infos 机制）。
  */
-import { PacketType, CompressionAlgo, RpcProtoName, MAX_SYNC_ITEMS, MAX_DIRECT_PEERS_REPORT, FULL_RESYNC_COOLDOWN_MS } from './constants.js';
+import { PacketType, CompressionAlgo, RpcProtoName, MAX_SYNC_ITEMS, MAX_DIRECT_PEERS_REPORT, MAX_ROUTE_INFO_BYTES, FULL_RESYNC_COOLDOWN_MS, WS_CLOSE } from './constants.js';
 import {
   protoTypes, toU64Long, randomU64Long, longToString,
 } from './proto.js';
@@ -48,7 +48,10 @@ export function buildRpcPacket({ fromPeer, toPeer, transactionId, descriptor, bo
     transactionId: toU64Long(transactionId),
     descriptor: {
       domainName: descriptor.domainName || '',
-      protoName: descriptor.protoName || RpcProtoName,
+      // protoName 缺省回落服务短名（官方语义 proto_name = prost 服务短名，与
+      // service_name 相同，如 "OspfRouteRpc"）；漏传时若落到 "peer_rpc"，
+      // 官方客户端按服务键校验会拒绝该 descriptor
+      protoName: descriptor.protoName || descriptor.serviceName || RpcProtoName,
       serviceName: descriptor.serviceName,
       // 官方 method_index 为 1-based（build/rpc.rs: (i + 1) as u8）
       methodIndex: descriptor.methodIndex ?? 1,
@@ -185,11 +188,9 @@ export async function handleRpcRequest(ctx, ws, header, payload) {
     `methodIndex=${methodIndex} bodyLen=${innerBody.length}`
   );
 
-  // 官方语义（service_registry.rs::ServiceKey）：proto_name 是 prost 服务短名，
-  // 与 service_name 相同（如 "OspfRouteRpc"）。历史上本实现用 "peer_rpc"，
-  // 为兼容旧测试数据，两者都接受。
-  if (protoName && protoName !== service && protoName !== RpcProtoName
-      && protoName !== `peer_rpc.${service}`) {
+  // 官方语义（service_registry.rs::ServiceKey）：proto_name = prost 服务短名
+  // （如 "OspfRouteRpc"）；本实现历史用 "peer_rpc"，为兼容旧测试数据两者都接受。
+  if (protoName && protoName !== service && protoName !== RpcProtoName) {
     ctx.log.debug(`drop rpc with unknown proto_name=${protoName}`);
     return false;
   }
@@ -235,13 +236,15 @@ async function handleSyncRouteInfo(ctx, ws, header, rpcPacket, innerBody) {
   }
 
   const pm = ctx.pm;
-  const session = pm.getSession(groupKey, fromPeerId, true);
 
   // 会话角色（官方：响应方 is_initiator = !请求方 is_initiator）
   if (typeof req.isInitiator === 'boolean') {
     ws._weAreInitiator = !req.isInitiator;
   }
-  session.dstSessionId = longToString(req.mySessionId);
+  // 对端会话 id 更新走统一入口（与 RpcResp 路径同一处重置）：客户端不断线重开会话时，
+  // 只更新 id 会残留旧增量状态（sentVersions/签名/foreignVer），
+  // 重启后的空表客户端将收不到已"sent"版本的路由与 connBitmap
+  pm.onRouteSessionAck(groupKey, fromPeerId, req.mySessionId);
 
   // 提取原始 RoutePeerInfo 字节（未知字段保留），与解码后的 items 一一对应
   const rawItems = extractRawPeerInfos(innerBody);
@@ -255,7 +258,7 @@ async function handleSyncRouteInfo(ctx, ws, header, rpcPacket, innerBody) {
     ctx.log.warn(
       `route flood guard: ${items.length} items > ${maxSyncItems} from=${fromPeerId}, closing (4009)`
     );
-    if (ctx.close) ctx.close(ws, 4009, 'route flood');
+    if (ctx.close) ctx.close(ws, WS_CLOSE.ROUTE_FLOOD, 'route flood');
     return;
   }
 
@@ -307,7 +310,7 @@ async function handleSyncRouteInfo(ctx, ws, header, rpcPacket, innerBody) {
   }
   if (oversized > 0) {
     ctx.log.warn(
-      `drop ${oversized} oversized route info entries (> ${ctx.config.maxRouteInfoBytes ?? 768}B) from=${fromPeerId}`
+      `drop ${oversized} oversized route info entries (> ${ctx.config.maxRouteInfoBytes ?? MAX_ROUTE_INFO_BYTES}B) from=${fromPeerId}`
     );
   }
   if (capped > 0) {
