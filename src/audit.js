@@ -3,8 +3,11 @@
  *
  * 设计（针对 Cloudflare 免费额度的成本控制）：
  * 1. 键值布局 —— 每类信息只占一条 KV 键（v1.4.1 起前缀为项目名，旧前缀仅迁移读取）：
- *    - 记录：easytier-cf-relay:rec:<type>，type ∈ groups|peers|routes|peercenter|sockets|digests|admin
- *    - 黑名单：easytier-cf-relay:bl:<cat>，cat ∈ peer|group|digest|socket
+ *    - 记录：easytier-cf-relay:<room>:rec:<type>（v1.7 A3 房间段，默认 room=global），
+ *      type ∈ groups|peers|routes|peercenter|sockets|digests|admin
+ *    - 黑名单：easytier-cf-relay:bl:<cat>（全局键，无房间段——边缘层在房间解析前读取），
+ *      cat ∈ peer|group|digest|socket
+ *    - 额度 shed 标记：easytier-cf-relay:shed:active（全局键，v1.7 A5，值 'true'/'false'）
  *    - 记录查询支持 type=all：跨类型按 id（全局时序）倒序合并，无需额外 KV 键
  * 2. 三级写入路径：
  *    - 事件发生 → 仅写内存（零成本）；
@@ -25,6 +28,8 @@
  *    刷爆记录列表并浪费写入额度）；拒绝次数改由 room.js 计数器统计。
  */
 
+import { KV_WRITE_DAILY_BUDGET, KV_SKIP_ORDER } from './constants.js';
+
 const RECORD_TYPES = ['groups', 'peers', 'routes', 'peercenter', 'sockets', 'digests', 'admin'];
 const RUNTIME_TYPES = ['groups', 'peers', 'routes', 'peercenter', 'sockets', 'digests'];
 const BLACKLIST_CATS = ['peer', 'group', 'digest', 'socket'];
@@ -38,7 +43,13 @@ const LEGACY_KV_PREFIX = 'et-relay:';
  * socket（客户端 IP）黑名单的 KV 键：Worker 入口边缘拦截只读这一条键，
  * 命中直接 403，不唤醒 Durable Object（省 DO 请求与时长计费）。
  */
-export const BL_SOCKET_KV_KEY = KV_PREFIX + 'bl:socket';/** 管理端审计：同一 IP 的登录记录折叠窗口 */
+export const BL_SOCKET_KV_KEY = KV_PREFIX + 'bl:socket';
+/**
+ * 额度 shed 标记键（v1.7 A5）：全局键（无房间段）——Worker 入口边缘层读同键，
+ * 激活时对新 WS 升级直接 429（已建立的 Hibernation 会话不吃 Worker 请求额度，
+ * 存量 mesh 不受影响）。值为 JSON 布尔（true/false）。
+ */
+export const SHED_KV_KEY = KV_PREFIX + 'shed:active';/** 管理端审计：同一 IP 的登录记录折叠窗口 */
 const LOGIN_DEDUP_MS = 10 * 60_000;
 
 /** 摘要抢占嫌疑（squat-suspect）记录的去重窗口与去重表上限 */
@@ -49,6 +60,34 @@ const SQUAT_DEDUP_MAX = 512;
 function normValue(cat, value) {
   if (cat === 'peer') return Number(value);
   return String(value ?? '');
+}
+
+/**
+ * UTC 日戳（YYYY-MM-DD）：KV 写日预算（v1.7 A4）与 kill 日计数（v1.7 D5，
+ * room.js）共用的重置锚点。
+ */
+export function utcDayStamp(now = Date.now()) {
+  return new Date(now).toISOString().slice(0, 10);
+}
+
+/**
+ * KV 预算牺牲序的保留优先级（v1.7 A4）：值越小越优先保留写入。
+ * 牺牲序（KV_SKIP_ORDER）内的键最后保留（预算耗尽时最先被跳），
+ * 其余 rec:*（含 admin 硬审计）优先于牺牲序键；bl:* 不参与排序（永不跳）。
+ */
+function keepRank(kvKey) {
+  const i = KV_SKIP_ORDER.indexOf(kvKey);
+  return i === -1 ? -1 : i;
+}
+
+/**
+ * v1.7 A3：审计记录键房间段清洗——房间 id 进 KV 键，空值回退 global。
+ * （房间 id 来自 ROOM_ID / ROOM_HEADER / ROOM_QUERY，原样入键即可保证
+ * 不同房间键不同；不解析回房间号，无需转义。）
+ */
+function normRoomId(roomId) {
+  const r = String(roomId ?? '').trim();
+  return r || 'global';
 }
 
 /**
@@ -102,7 +141,40 @@ export class AuditStore {
     this.adminAuditLimit = Number(opts.adminAuditLimit) > 0 ? Number(opts.adminAuditLimit) : 200;
     this.ipMask = opts.ipMask === true;
     this.retentionDays = Number(opts.retentionDays) > 0 ? Math.floor(Number(opts.retentionDays)) : 0;
-    this.log = opts.log || { warn: () => {}, debug: () => {} };
+    /**
+     * v1.7 A3：审计记录 KV 键房间段（rec 键 = easytier-cf-relay:<room>:rec:<type>）。
+     * 默认 'global'（env ROOM_ID）；ROOM_HEADER/QUERY 分片时由 room.fetch 在
+     * audit.init 之前 setRoomId 覆盖（此后写入/恢复都落在对应房间键上）。
+     * 黑名单键（bl:*）不带房间段——边缘层读 bl:socket 发生在房间解析之前，
+     * 且 socket(IP) 黑名单语义跨房间（同一肇事 IP 对任何房间都拦截）。
+     */
+    this.roomId = normRoomId(opts.roomId);
+    // v1.7 C5：默认桩补 info——迁移路径（:167）与 reloadBlacklists 的 log.info
+    // 在无 logger 注入时不再抛 TypeError 被 catch 误吞（后者会误置降级态）
+    this.log = opts.log || { warn: () => {}, debug: () => {}, info: () => {} };
+
+    /** v1.7 D5：宿主 room 计数器引用（kvWriteFailed / kvWriteBudgetSkipped 上报；可空） */
+    this.counters = opts.counters || null;
+    /**
+     * v1.7 C5：黑名单降级态——init 时 KV 恢复失败（配额/异常）置位。
+     * 置位期间本实例内存黑名单可能不完整（fail-open 窗口显式化），
+     * room alarm 按 60s 节流调用 reloadBlacklists() 重试，成功即清除。
+     */
+    this.blDegraded = false;
+    /** v1.7 A4：KV 写日预算（尝试口径；UTC 日重置；随 audit 状态持久化） */
+    this.kvBudget = { date: utcDayStamp(), used: 0 };
+    /**
+     * v1.7 A5：额度 shed 激活态（本 DO 内存视图）。真源 = KV shed 键 +
+     * audit_state 快照双份（KV 不可用时 DO storage 仍可恢复）；
+     * room 层只读本字段做 DO 升级拒绝与统计展示。
+     */
+    this.shedActive = false;
+    /**
+     * v1.7 复核修复：shed 键 KV 镜像待重试标记——写失败（KV 异常）后置位，
+     * room 每轮 shed 检查调用 retryShedKvIfDirty() 幂等重写（否则一次瞬时
+     * 失败会让边缘层整天读不到标记）。
+     */
+    this.shedKvDirty = false;
 
     /** @type {Map<string, object[]>} type -> 记录数组（旧→新） */
     this.records = new Map(RECORD_TYPES.map((t) => [t, []]));
@@ -123,6 +195,77 @@ export class AuditStore {
     this._squatDedup = new Map();
   }
 
+  /**
+   * v1.7 A3：KV 键拼接收口——rec 键插房间段，bl 键保持全局（见 constructor 注释）。
+   * @param {string} shortKey 'rec:<type>' 或 'bl:<cat>'（_kvDirty 内的短键形态）
+   */
+  _kvKey(shortKey) {
+    return KV_PREFIX + (shortKey.startsWith('rec:') ? this.roomId + ':' + shortKey : shortKey);
+  }
+
+  /**
+   * v1.7 A3：分片部署的房间段更新。必须在 audit.init()（KV 恢复读键）之前
+   * 调用才对恢复生效（room.fetch 首包先解析房间再惰性 init）；init 之后变更
+   * 仅影响后续写入键名——恢复数据仍来自先前房间的键，打 warn 提示（分片
+   * 部署建议仅用 ROOM_ID 配置房间，避免 header/query 动态房间跨 DO 代际）。
+   */
+  setRoomId(roomId) {
+    const r = normRoomId(roomId);
+    if (r === this.roomId) return;
+    const wasLoaded = this._loaded;
+    this.roomId = r;
+    if (wasLoaded) {
+      this.log.warn(`audit roomId changed to "${r}" after init; restored data came from the previous room's keys`);
+    }
+  }
+
+  /**
+   * v1.7 A5：额度 shed 标记翻转（全局键，无房间段；边缘层读同键）。
+   * 过渡即写（不走 10 分钟 flush 节奏——激活延迟要求分钟级内生效）；
+   * KV 写计入 A4 日预算（尝试口径）但【永不牺牲】：shed 激活恰是额度告急
+   * 场景，标记写不出去等于没有防线。同时随 audit_state 快照持久化（KV
+   * 不可用时 DO storage 仍可恢复）。
+   * @param {boolean} active
+   * @returns {boolean} 是否发生状态变化
+   */
+  async setShedFlag(active) {
+    const next = active === true;
+    if (next === this.shedActive) return false;
+    this.shedActive = next;
+    this._storageDirty = true; // 快照随下一轮 flush 落盘
+    await this._writeShedKv();
+    return true;
+  }
+
+  /**
+   * v1.7 复核修复：shed 键 KV 镜像实际写入。
+   * - KV put 只接受 string/ArrayBuffer/View/Stream——**布尔值会抛类型错误**
+   *   （此前直接写 `next` 被 catch 吞掉：shedActive 只在 DO 内存生效，
+   *   边缘层 lookupShedFlag 永远读不到，A5 边缘 429 实际失效）；
+   * - 写字符串 'true'/'false'，读侧 get(key,'json') 仍得到布尔；
+   * - 失败置 shedKvDirty，由 room 的下一轮检查幂等重试。
+   */
+  async _writeShedKv() {
+    if (!this.kv) return;
+    try {
+      this._ensureBudgetDay(Date.now());
+      await this.kv.put(SHED_KV_KEY, this.shedActive ? 'true' : 'false');
+      this.kvBudget.used += 1;
+      this.shedKvDirty = false;
+    } catch (e) {
+      this.kvBudget.used += 1; // 尝试口径：失败同样占用配额
+      this.shedKvDirty = true;
+      if (this.counters) this.counters.kvWriteFailed += 1;
+      this.log.warn(`shed flag kv write failed: ${e.message}`);
+    }
+  }
+
+  /** v1.7 复核修复：shed 键写失败后的幂等重试（room 每轮 shed 检查调用；非脏时零开销） */
+  async retryShedKvIfDirty() {
+    if (!this.shedKvDirty || !this.kv) return;
+    await this._writeShedKv();
+  }
+
   // -------------------------------------------------------------------
   // 初始化 / 持久化
   // -------------------------------------------------------------------
@@ -134,41 +277,92 @@ export class AuditStore {
       const saved = await this.storage.get(STATE_KEY);
       if (saved) {
         this._loadSnapshot(saved);
+        // v1.7 A5：KV shed 键可能比快照更新（过渡即写 vs 快照 30s 节奏）——取「或」；
+        // v1.7 复核修复：快照与 KV 不一致（或 KV 读失败但快照为激活）时置 shedKvDirty，
+        // 由下一轮检查幂等重写，避免「内存 true / KV false」长期分叉
+        if (this.kv) {
+          try {
+            const shed = await this.kv.get(SHED_KV_KEY, 'json');
+            if (shed === true) this.shedActive = true;
+            if (this.shedActive !== (shed === true)) this.shedKvDirty = true;
+          } catch {
+            if (this.shedActive) this.shedKvDirty = true;
+          }
+        }
         return;
       }
     } catch (e) {
       this.log.warn(`audit load failed: ${e.message}`);
     }
-    // 冷启动回退：DO storage 为空（首次部署/被重置）时从 KV 恢复
+    // 冷启动回退：DO storage 为空（首次部署/被重置）时从 KV 恢复。
+    // 键层级（v1.7 A3）：rec 键 = <prefix><room>:rec:<t>；bl 键 = <prefix>bl:<c>（全局）。
     if (this.kv) {
-      let restored = false;
+      let restoredRec = false;
+      let restoredBl = false;
       try {
         for (const t of RECORD_TYPES) {
-          const v = await this.kv.get(KV_PREFIX + 'rec:' + t, 'json');
-          if (Array.isArray(v) && v.length) { this.records.set(t, v); restored = true; }
+          const v = await this.kv.get(this._kvKey('rec:' + t), 'json');
+          if (Array.isArray(v) && v.length) { this.records.set(t, v); restoredRec = true; }
         }
         for (const c of BLACKLIST_CATS) {
-          const v = await this.kv.get(KV_PREFIX + 'bl:' + c, 'json');
-          if (Array.isArray(v) && v.length) { this.blacklist.set(c, v); restored = true; }
+          const v = await this.kv.get(this._kvKey('bl:' + c), 'json');
+          if (Array.isArray(v) && v.length) { this.blacklist.set(c, v); restoredBl = true; }
         }
-        // 一次性迁移（v1.4.1）：新前缀完全无数据时回读旧前缀（et-relay:），
-        // 数据随后由正常刷盘写入新键；旧键保留不删（零成本，留回滚路径，
-        // 确认运行正常后可手动删除）。
-        if (!restored) {
+        // 一次性迁移 v2（v1.7 A3；v1.7 复核修复：按类型判定）：某类型在房间段键
+        // 中无数据才回读 v1.6.x 无段键（easytier-cf-relay:rec:<t>）——单类型缺失
+        // 不再被「其他类型有数据」挡住。数据随后由正常刷盘写回房间段键；旧键保留
+        // 不删（回滚路径）。分片部署各房间会各自复制一份基线（升级前共享同组键，
+        // 数据无法按房间归属）。
+        let migrated = false;
+        for (const t of RECORD_TYPES) {
+          if ((this.records.get(t) || []).length) continue;
+          const v = await this.kv.get(KV_PREFIX + 'rec:' + t, 'json');
+          if (Array.isArray(v) && v.length) { this.records.set(t, v); migrated = true; }
+        }
+        if (migrated) {
+          this.log.info(`audit rec data migrated to room-segmented keys (room=${this.roomId})`);
+          restoredRec = true;
+        }
+        // 一次性迁移 v1（v1.4.1；v1.7 复核修复：rec/bl 分离触发）：仅当某一族在
+        // 新前缀完全无数据时回读旧前缀 et-relay: 的对应族——既不让「新 rec 有数据
+        // + 新 bl 为空」时旧 bl 永久丢失，也不复活已被清理的旧数据。
+        if (!restoredRec) {
           let legacy = false;
           for (const t of RECORD_TYPES) {
+            if ((this.records.get(t) || []).length) continue;
             const v = await this.kv.get(LEGACY_KV_PREFIX + 'rec:' + t, 'json');
             if (Array.isArray(v) && v.length) { this.records.set(t, v); legacy = true; }
           }
+          if (legacy) {
+            this.log.info('audit rec data migrated from legacy "et-relay:" keys');
+            restoredRec = true;
+          }
+        }
+        if (!restoredBl) {
+          let legacy = false;
           for (const c of BLACKLIST_CATS) {
+            if ((this.blacklist.get(c) || []).length) continue;
             const v = await this.kv.get(LEGACY_KV_PREFIX + 'bl:' + c, 'json');
             if (Array.isArray(v) && v.length) { this.blacklist.set(c, v); legacy = true; }
           }
-          if (legacy) this.log.info('audit KV data migrated from legacy "et-relay:" keys');
+          if (legacy) {
+            this.log.info('audit bl data migrated from legacy "et-relay:" keys');
+            restoredBl = true;
+          }
         }
       } catch (e) {
         this.log.warn(`audit kv restore failed: ${e.message}`);
+        // v1.7 C5 / 复核修复：审计恢复降级态——记录或黑名单任一族恢复失败均置位
+        // （此前只覆盖黑名单，记录类会永久部分恢复并可能被后续 flush 固化）；
+        // room alarm 周期重试（reloadBlacklists 同时回读记录类空类型）。
+        this.blDegraded = true;
       }
+      // v1.7 A5：shed 标记恢复（独立 try——失败不影响恢复降级态语义；
+      // KV 不可用时由 audit_state 快照兜底，见 _loadSnapshot）
+      try {
+        const shed = await this.kv.get(SHED_KV_KEY, 'json');
+        if (shed === true) this.shedActive = true;
+      } catch { /* 读失败保持 false（放行 + DO 层兜底） */ }
       for (const t of RECORD_TYPES) {
         for (const r of this.records.get(t) || []) {
           if (Number.isFinite(r.id) && r.id > this.seq) this.seq = r.id;
@@ -204,6 +398,17 @@ export class AuditStore {
         }
       }
     }
+    // v1.7 A4：KV 写日预算恢复——跨 UTC 日恢复直接按今天重置（used 不跨日累计）
+    if (saved.kvBudget && typeof saved.kvBudget === 'object') {
+      const d = utcDayStamp();
+      const date = String(saved.kvBudget.date || '');
+      this.kvBudget = date === d
+        ? { date, used: Number(saved.kvBudget.used) || 0 }
+        : { date: d, used: 0 };
+    }
+    // v1.7 A5：shed 态恢复（与 KV shed 键双源——快照优先级同 KV，取「真」即可；
+    // 快照恢复路径不读 KV shed 键，二者由翻转时双写保持一致）
+    this.shedActive = saved.shed === true;
   }
 
   _snapshot() {
@@ -211,7 +416,18 @@ export class AuditStore {
     for (const [t, arr] of this.records) records[t] = arr;
     const blacklist = {};
     for (const [c, arr] of this.blacklist) blacklist[c] = arr;
-    return { v: 1, seq: this.seq, records, blacklist, config: this.config };
+    // v1.7 A5：shed 态入快照（KV 不可用时 DO storage 恢复兜底）
+    return { v: 1, seq: this.seq, records, blacklist, config: this.config, kvBudget: this.kvBudget, shed: this.shedActive };
+  }
+
+  /** v1.7 A4：KV 写日预算的 UTC 日惰性重置（flush 写路径入口调用） */
+  _ensureBudgetDay(now = Date.now()) {
+    const d = utcDayStamp(now);
+    if (this.kvBudget.date !== d) {
+      this.kvBudget.date = d;
+      this.kvBudget.used = 0;
+      this._storageDirty = true;
+    }
   }
 
   /**
@@ -232,26 +448,77 @@ export class AuditStore {
     if (!this.kv || this._kvDirty.size === 0) return;
     if (!opts.forceKv && now - this._lastKvFlush < this.flushMs) return;
     this._lastKvFlush = now;
-    const keys = Array.from(this._kvDirty);
+    this._ensureBudgetDay(now);
+    // v1.7 A4：KV 写日预算门禁——预算内全写；超预算按牺牲序跳 rec 键，
+    // bl:* 黑名单键永不跳（安全语义优先于预算）。跳过键保持脏标记，
+    // 次日 UTC 重置（或预算释放）后由下一轮 flush 自动补写。
+    let budgetLeft = Math.max(0, KV_WRITE_DAILY_BUDGET - this.kvBudget.used);
+    const all = Array.from(this._kvDirty);
     this._kvDirty.clear();
+    const allowed = [];
+    const skipped = [];
+    if (all.length > budgetLeft) {
+      const bl = [];
+      const rec = [];
+      for (const k of all) (k.startsWith('bl:') ? bl : rec).push(k);
+      rec.sort((a, b) => keepRank(a) - keepRank(b));
+      for (const k of rec) {
+        if (budgetLeft > 0) { allowed.push(k); budgetLeft -= 1; }
+        else skipped.push(k);
+      }
+      allowed.push(...bl);
+    } else {
+      allowed.push(...all);
+    }
+    if (skipped.length > 0) {
+      for (const k of skipped) this._kvDirty.add(k);
+      if (this.counters) this.counters.kvWriteBudgetSkipped += skipped.length;
+      this.log.warn(
+        `kv write budget exhausted (${this.kvBudget.used}/${KV_WRITE_DAILY_BUDGET}), ` +
+        `skipped: ${skipped.join(', ')}`
+      );
+    }
     // v1.4.1：分批写 KV——免费计划单次调用同时打开的连接数上限为 6，
     // 脏键最多 11 个（7 记录 + 4 黑名单），一次性 Promise.all 会触发排队。
+    // v1.7 D5：失败按批回滚脏标记 + kvWriteFailed 计数；预算按「尝试」计
+    // （失败请求同样占用 KV 配额口径，防重试风暴双计）。
     const CHUNK = 6;
-    try {
-      for (let i = 0; i < keys.length; i += CHUNK) {
-        await Promise.all(keys.slice(i, i + CHUNK).map((k) => this.kv.put(
-          KV_PREFIX + k,
+    for (let i = 0; i < allowed.length; i += CHUNK) {
+      const batch = allowed.slice(i, i + CHUNK);
+      try {
+        await Promise.all(batch.map((k) => this.kv.put(
+          this._kvKey(k),
           JSON.stringify(k.startsWith('rec:') ? this.records.get(k.slice(4)) : this.blacklist.get(k.slice(3)))
         )));
+        this.kvBudget.used += batch.length;
+      } catch (e) {
+        this.log.warn(`audit flush to kv failed: ${e.message}`);
+        for (const k of batch) this._kvDirty.add(k); // 失败下轮重试
+        if (this.counters) this.counters.kvWriteFailed += batch.length;
+        this.kvBudget.used += batch.length;
       }
-    } catch (e) {
-      this.log.warn(`audit flush to kv failed: ${e.message}`);
-      for (const k of keys) this._kvDirty.add(k); // 失败下轮重试
     }
   }
 
   isDirty() {
     return this._storageDirty || this._kvDirty.size > 0;
+  }
+
+  /**
+   * v1.7 复核修复：是否存在「可立即写入」的脏数据。
+   * A4 预算耗尽后被跳过的 rec 键会常驻 _kvDirty 等待次日——isDirty() 因此恒真，
+   * 若直接用于 alarm 排程会把空闲房间从 idle 退避（300s）拉回 15s 节奏（≈5,760
+   * 请求/天，与 A4/A5 的省额度目标相反）。本方法在预算耗尽日忽略此类键
+   *（bl:* 仍可写故仍算可写），跨日重置后由 idle 节奏的 flush 自动补齐。
+   */
+  hasFlushableDirty() {
+    if (this._storageDirty) return true;
+    if (this._kvDirty.size === 0 || !this.kv) return false;
+    const today = utcDayStamp();
+    const exhausted = this.kvBudget.date === today && this.kvBudget.used >= KV_WRITE_DAILY_BUDGET;
+    if (!exhausted) return true;
+    for (const k of this._kvDirty) if (k.startsWith('bl:')) return true;
+    return false;
   }
 
   // -------------------------------------------------------------------
@@ -494,18 +761,21 @@ export class AuditStore {
     const arr = this.blacklist.get(cat);
     if (ids === 'all') {
       const n = arr.length;
+      const values = arr.map((e) => String(e.value));
       arr.length = 0;
       if (n > 0) this._touch('bl:' + cat);
-      return { ok: true, removed: n };
+      // v1.7 C4：values 供宿主清限流观察窗（解除拉黑 = 重新观察）
+      return { ok: true, removed: n, values };
     }
     const wanted = new Set((ids || []).map(Number));
     const before = arr.length;
+    const values = [];
     for (let i = arr.length - 1; i >= 0; i--) {
-      if (wanted.has(arr[i].id)) arr.splice(i, 1);
+      if (wanted.has(arr[i].id)) { values.push(String(arr[i].value)); arr.splice(i, 1); }
     }
     const removed = before - arr.length;
     if (removed > 0) this._touch('bl:' + cat);
-    return { ok: true, removed };
+    return { ok: true, removed, values };
   }
 
   blacklistHas(cat, value) {
@@ -528,6 +798,57 @@ export class AuditStore {
     }
     counts._total = total;
     return counts;
+  }
+
+  /**
+   * v1.7 C5：黑名单降级恢复——init 时 KV 恢复失败（配额/异常）后由 room alarm
+   * 按 60s 节流调用本方法重试，成功即清除降态。与内存已有条目按 value 合并
+   * （降级窗口内管理端新增不丢失），恢复出的条目由下一轮 flush 回写 DO storage。
+   * @returns {boolean} 是否成功完成一次恢复尝试（无异常即 true，含无数据可恢复）
+   */
+  async reloadBlacklists() {
+    if (!this.kv || !this.blDegraded) return false;
+    try {
+      let added = 0;
+      // 黑名单：按 value 合并（降级窗口内管理端新增不丢失）
+      for (const c of BLACKLIST_CATS) {
+        const v = await this.kv.get(this._kvKey('bl:' + c), 'json');
+        if (!Array.isArray(v) || !v.length) continue;
+        const cur = this.blacklist.get(c);
+        const have = new Set(cur.map((e) => String(e.value)));
+        for (const e of v) {
+          if (e && !have.has(String(e.value))) { cur.push(e); have.add(String(e.value)); added += 1; }
+        }
+      }
+      // v1.7 复核修复：恢复降级语义扩展至记录类——仅回读「内存为空」的类型
+      //（恢复失败的通常是空类型；非空类型不合并，避免覆盖/复活已清理数据），
+      // 按 id 去重合并。
+      for (const t of RECORD_TYPES) {
+        const cur = this.records.get(t) || [];
+        if (cur.length) continue;
+        const v = await this.kv.get(this._kvKey('rec:' + t), 'json');
+        if (!Array.isArray(v) || !v.length) continue;
+        this.records.set(t, v);
+        added += v.length;
+      }
+      for (const t of RECORD_TYPES) {
+        for (const r of this.records.get(t) || []) {
+          if (Number.isFinite(r.id) && r.id > this.seq) this.seq = r.id;
+        }
+      }
+      for (const c of BLACKLIST_CATS) {
+        for (const r of this.blacklist.get(c) || []) {
+          if (Number.isFinite(r.id) && r.id > this.seq) this.seq = r.id;
+        }
+      }
+      this.blDegraded = false;
+      if (added > 0) this._storageDirty = true;
+      this.log.info('audit restore recovered (records+blacklist, degraded cleared)');
+      return true;
+    } catch (e) {
+      this.log.warn(`audit reload failed: ${e.message}`);
+      return false;
+    }
   }
 
   /**

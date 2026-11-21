@@ -27,6 +27,7 @@
  *     GET  <ADMIN_PATH>/api/blacklist         黑名单查询（?cat=&offset=&limit=）
  *     POST <ADMIN_PATH>/api/blacklist/add     黑名单手工添加
  *     POST <ADMIN_PATH>/api/blacklist/delete  黑名单移除（解除封锁）
+ *     POST <ADMIN_PATH>/api/shed/clear        额度 shed 手动清除（v1.7 A5）
  *                             （不配置 ADMIN_PATH + ADMIN_TOKEN 则完全禁用）
  * - 任意路径 WebSocket 升级 -> DO（官方客户端用用户配置的 URL，路径不定，
  *   官方服务端同样接受任意路径；保留路径除外）。升级前先做边缘层
@@ -41,10 +42,11 @@
  * DO 命名：默认单一房间 "global"。可通过 ROOM_HEADER / ROOM_QUERY 自定义
  * 房间分片（例如按地域部署多个 Worker 路由不同房间），不同房间互不可见。
  */
-import { RelayRoom } from './room.js';
+import { RelayRoom, resolveRoomId } from './room.js'; // v1.7 A3：解析逻辑收口 room.js（审计键房间段与 DO 命名同源）
 import { ADMIN_HTML } from './admin_ui.js';
 import { FAVICON_PNG } from './assets.js';
-import { BL_SOCKET_KV_KEY } from './audit.js';
+import { BL_SOCKET_KV_KEY, SHED_KV_KEY } from './audit.js';
+import { BL_NEG_CACHE_TTL_MS, SHED_EDGE_CACHE_MS, ROOM_HEADER_INTERNAL } from './constants.js';
 import { statsToPrometheus } from './prometheus.js';
 
 export { RelayRoom };
@@ -87,21 +89,6 @@ function normalizePath(p) {
   return v;
 }
 
-function resolveRoomId(request, url, env) {
-  // 优先级：Header > Query 参数 > 环境变量默认值
-  const headerName = str(env, 'ROOM_HEADER', '');
-  if (headerName) {
-    const v = request.headers.get(headerName);
-    if (v) return v;
-  }
-  const queryName = str(env, 'ROOM_QUERY', '');
-  if (queryName) {
-    const v = url.searchParams.get(queryName);
-    if (v) return v;
-  }
-  return str(env, 'ROOM_ID', 'global');
-}
-
 /** WebSocket 升级的保留路径：健康检查、统计/管理端点（含未启用时的默认字面量） */
 function isReservedPath(pathname, metricsPath, adminPath, healthPath) {
   if (pathname === '/favicon.ico') return true;
@@ -119,7 +106,7 @@ function isReservedPath(pathname, metricsPath, adminPath, healthPath) {
  * 由 DO 升级/握手层的权威黑名单兜底。代价仅是新拉黑 IP 的边缘拦截
  * 延后至多 TTL（叠加 KV 最终一致的约 1 分钟）。IP_BLOCK_CACHE_MS=0 关闭。
  */
-const blCache = { at: 0, list: null };
+const blCache = { at: 0, list: null, failedAt: 0 };
 
 function intEnv(env, key, def) {
   const v = env && env[key];
@@ -128,18 +115,76 @@ function intEnv(env, key, def) {
   return Number.isFinite(n) && n >= 0 ? n : def;
 }
 
-async function lookupSocketBlacklist(env, ttlMs) {
+export async function lookupSocketBlacklist(env, ttlMs) {
   if (ttlMs > 0) {
     const now = Date.now();
     if (now - blCache.at < ttlMs) return blCache.list;
-    const raw = await env.AUDIT_KV.get(BL_SOCKET_KV_KEY, 'json');
-    const list = Array.isArray(raw) ? raw : null;
-    blCache.at = now;
-    blCache.list = list;
-    return list;
+    // v1.7 C5：负缓存——KV 读失败后短窗内不再重试。重连风暴会在大量新 isolate
+    // 生成首次升级读，无退避即逐请求重试；窗口内返回 null（缓存未命中语义），
+    // 放行走 DO 权威兜底，「只延后拦截、绝不漏放」语义不变。
+    if (blCache.failedAt && now - blCache.failedAt < BL_NEG_CACHE_TTL_MS) return null;
+    try {
+      const raw = await env.AUDIT_KV.get(BL_SOCKET_KV_KEY, 'json');
+      const list = Array.isArray(raw) ? raw : null;
+      blCache.at = now;
+      blCache.list = list;
+      blCache.failedAt = 0;
+      return list;
+    } catch (e) {
+      blCache.failedAt = Date.now();
+      throw e;
+    }
   }
   const raw = await env.AUDIT_KV.get(BL_SOCKET_KV_KEY, 'json');
   return Array.isArray(raw) ? raw : null;
+}
+
+/** 仅供测试：复位 isolate 缓存（含负缓存锚点）；生产代码勿用 */
+export function resetBlCacheForTest() {
+  blCache.at = 0;
+  blCache.list = null;
+  blCache.failedAt = 0;
+}
+
+/**
+ * 边缘层额度 shed 标记 isolate 缓存（v1.7 A5）：TTL 内的 WS 升级直接用缓存
+ * 判定（激活时对新连接 429 + Retry-After；已建立的 Hibernation 会话不吃
+ * Worker 请求额度，不受影响）。语义与黑名单缓存相反——读失败【维持上次值】
+ * （shed 已激活时读失败继续拒绝，宁误 shed 不漏 shed；未激活时读失败放行，
+ * DO 层兜底拒绝）。未绑定 AUDIT_KV 恒 false（边缘层不可用，DO 层兜底）。
+ */
+const shedCache = { at: 0, value: false, failedAt: 0 };
+
+export async function lookupShedFlag(env, ttlMs) {
+  if (!env.AUDIT_KV) return false;
+  if (ttlMs > 0) {
+    const now = Date.now();
+    if (now - shedCache.at < ttlMs) return shedCache.value;
+    // 负缓存：读失败维持上次值短窗内不重试（与黑名单「返回 null 放行」相反，
+    // shed 语义是「已激活就继续拒绝」）
+    if (shedCache.failedAt && now - shedCache.failedAt < SHED_EDGE_CACHE_MS) {
+      return shedCache.value;
+    }
+    try {
+      const v = await env.AUDIT_KV.get(SHED_KV_KEY, 'json');
+      shedCache.at = now;
+      shedCache.value = v === true;
+      shedCache.failedAt = 0;
+      return shedCache.value;
+    } catch (e) {
+      shedCache.failedAt = Date.now();
+      throw e;
+    }
+  }
+  const v = await env.AUDIT_KV.get(SHED_KV_KEY, 'json');
+  return v === true;
+}
+
+/** 仅供测试：复位 shed isolate 缓存；生产代码勿用 */
+export function resetShedCacheForTest() {
+  shedCache.at = 0;
+  shedCache.value = false;
+  shedCache.failedAt = 0;
 }
 
 export default {
@@ -176,7 +221,10 @@ export default {
       const roomId = resolveRoomId(request, url, env);
       const stub = env.RELAY_ROOM.get(env.RELAY_ROOM.idFromName(roomId));
       if (url.searchParams.get('format') === 'prometheus') {
-        const res = await stub.fetch(new Request('https://do/internal/stats', { method: 'GET' }));
+        // v1.7 复核修复：内部转发统一注入房间头（分片部署下 DO 依此对齐审计房间）
+        const res = await stub.fetch(new Request('https://do/internal/stats', {
+          method: 'GET', headers: { [ROOM_HEADER_INTERNAL]: roomId },
+        }));
         const stats = await res.json();
         return new Response(statsToPrometheus(stats), {
           headers: {
@@ -187,7 +235,9 @@ export default {
       }
       // /metrics 在 handleAdmin 作用域之外（doInternal 不可见）；统计 JSON
       // 本身无缓存指令，但管理 API 统一 no-store：这里直接补头
-      const statsRes = await stub.fetch(new Request('https://do/internal/stats', { method: 'GET' }));
+      const statsRes = await stub.fetch(new Request('https://do/internal/stats', {
+        method: 'GET', headers: { [ROOM_HEADER_INTERNAL]: roomId },
+      }));
       const h2 = new Headers(statsRes.headers);
       h2.set('cache-control', 'no-store');
       return new Response(statsRes.body, { status: statsRes.status, headers: h2 });
@@ -223,23 +273,48 @@ export default {
                 headers: { 'retry-after': '60' }, // 建议客户端退避重试
               });
             }
-          } catch { /* KV 读失败：放行走 DO 权威检查 */ }
+          } catch (e) {
+            // v1.7 C5/D5：读失败已进负缓存（8s 内不重试）；日志级信号——
+            // 边缘层失败对 DO 不可见，不进 counters（看护 a/b 数据源一致性），
+            // 与既有「边缘层拒绝不计数」残余风险登记同口径
+            console.warn(`edge blacklist kv read failed (negative-cached): ${e && e.message}`);
+          }
         }
       }
       const roomId = resolveRoomId(request, url, env);
       const stub = env.RELAY_ROOM.get(env.RELAY_ROOM.idFromName(roomId));
+      // v1.7 A5：额度 shed——当日用量触顶（Error 1027 之前）时在边缘拒绝
+      // 【新】连接（429 + Retry-After，与 per-IP 429 同形态零指纹）；已建立的
+      // Hibernation 会话不吃 Worker 请求额度，存量 mesh 跑到当日 UTC 复位。
+      // 读失败维持上次值（宁误 shed 不漏 shed）；未绑定 AUDIT_KV 时边缘层
+      // 跳过，由 DO 层兜底拒绝（room.js fetch）。
+      if (env.AUDIT_KV) {
+        try {
+          if (await lookupShedFlag(env, SHED_EDGE_CACHE_MS)) {
+            return new Response('Too many requests', {
+              status: 429,
+              headers: { 'retry-after': '300' },
+            });
+          }
+        } catch (e) {
+          console.warn(`edge shed kv read failed (keep-last-value): ${e && e.message}`);
+        }
+      }
       // 升级请求必须原样转发（构造副本会破坏升级流，workerd 不支持）；
       // 「Upgrade 头 + /internal/*」的鉴权绕过由 DO 层守卫统一拦截（room.js fetch）。
       return stub.fetch(request);
     }
 
-    // 其余未知路径（v1.4.1）：一律挂起不响应（tar pit）——不返回 404、不泄露
-    // 服务器行为指纹，让路径扫描器空等到自身超时。仅影响非 WS 升级请求
-    // （EasyTier 客户端只走升级，不受影响）；健康检查/favicon/统计/管理端等
-    // 保留路径在上方各有自己的响应。CPU 成本为零（纯挂起流），
-    // TARPIT_UNKNOWN="0" 关闭（恢复 404，排障用）。
+    // 其余未知路径（v1.4.1）：tar pit——不返回 404、不泄露服务器行为指纹。
+    // v1.7 复核 V-07 生产实测：实际行为为 200 + application/octet-stream 空体、
+    // body 立即关闭（workerd 对空构造 ReadableStream 不挂起，与本地 dev 一致）；
+    // 防指纹目的达成，「让扫描器空等」不成立——真挂起备选实现（分支内
+    // `await new Promise(() => {})`）暂不采用（备选实现仅此一处）。仅影响非
+    // WS 升级请求（EasyTier 客户端只走升级，不受影响）；健康检查/favicon/
+    // 统计/管理端等保留路径在上方各有自己的响应。TARPIT_UNKNOWN="0" 关闭
+    // （恢复 404，排障用）。
     if (str(env, 'TARPIT_UNKNOWN', '1') !== '0') {
-      return new Response(new ReadableStream({ /* 永不 enqueue/close */ }), {
+      return new Response(new ReadableStream({ /* workerd 空构造流即关闭（V-07 实测） */ }), {
         status: 200,
         headers: { 'content-type': 'application/octet-stream' },
       });
@@ -277,11 +352,21 @@ async function handleAdmin(request, url, env, adminPath) {
   const stub = env.RELAY_ROOM.get(env.RELAY_ROOM.idFromName(roomId));
   // 管理 API 响应统一 no-store：状态/记录含拓扑与 IP
   // 明细，不应进入任何缓存（页面壳此前已有 no-store，API 缺失）。
-  const doInternal = (reqOrUrl, init) => stub.fetch(reqOrUrl, init).then((r) => {
-    const h = new Headers(r.headers);
-    h.set('cache-control', 'no-store');
-    return new Response(r.body, { status: r.status, statusText: r.statusText, headers: h });
-  });
+  // v1.7 复核修复：内部请求统一注入房间头——index 已按外部请求选中房间 DO，
+  // 但内部请求本身无 ROOM_HEADER/QUERY 线索；不带此头时 DO 会回退 env 默认
+  // 房间（分片部署下跨房间写审计键）。重建 Request（内部请求均为非升级 HTTP，
+  // 安全）；WS 升级请求仍原样转发（workerd 不支持重建升级流）。
+  const doInternal = (reqOrUrl, init) => {
+    const req = reqOrUrl instanceof Request ? reqOrUrl : new Request(reqOrUrl, init);
+    const h = new Headers(req.headers);
+    h.set(ROOM_HEADER_INTERNAL, roomId);
+    // 以 Request 为 input 重建（规范语义：复制 method/url/body，init.headers 覆盖）
+    return stub.fetch(new Request(req, { headers: h })).then((r) => {
+      const rh = new Headers(r.headers);
+      rh.set('cache-control', 'no-store');
+      return new Response(r.body, { status: r.status, statusText: r.statusText, headers: rh });
+    });
+  };
   // 管理员来源 IP（DO 内部端点用于审计登录/操作/查看）
   const adminHeaders = {
     'content-type': 'application/json',
@@ -356,6 +441,12 @@ async function handleAdmin(request, url, env, adminPath) {
     const body = await request.text();
     return doInternal(new Request('https://do/internal/blacklist/delete', {
       method: 'POST', headers: adminHeaders, body,
+    }));
+  }
+  // 额度 shed 手动清除（v1.7 A5）：管理页额度卡横幅按钮 → DO 清 KV 标记 + 复位自计数
+  if (sub === '/api/shed/clear' && request.method === 'POST') {
+    return doInternal(new Request('https://do/internal/shed/clear', {
+      method: 'POST', headers: adminHeaders,
     }));
   }
 

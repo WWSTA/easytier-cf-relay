@@ -21,11 +21,15 @@ import {
   SERVER_FEATURES, LIVENESS_ECHO_FEATURE,
   ROUTE_INFO_TTL_MS, ROUTE_INFO_UNREACHABLE_MS, GROUP_AUTO_DELETE_MS,
   MAX_SYNC_ITEMS, MAX_ROUTE_INFO_BYTES, MAX_ROUTES_PER_GROUP, MAX_DIRECT_PEERS_REPORT,
-  FULL_RESYNC_COOLDOWN_MS, MAX_NETWORK_NAME_BYTES, WS_CLOSE,
+  FULL_RESYNC_COOLDOWN_MS, MAX_NETWORK_NAME_BYTES, WS_CLOSE, KV_WRITE_DAILY_BUDGET,
+  RPC_MERGER_TTL_MS,
+  SHED_ACTIVATE_RATIO, SHED_RESUME_RATIO, SHED_CHECK_MS,
+  AUTO_BLACKLIST_KILLS, AUTO_BLACKLIST_WINDOW_MS, AUTO_BLACKLIST_WINDOW_MAX_IPS,
+  ROOM_HEADER_INTERNAL,
 } from './constants.js';
 import { parseHeader, buildPacket, bumpForward, payloadOf } from './packet.js';
 import { PeerManager, resolveGroupKey } from './peer_manager.js';
-import { AuditStore } from './audit.js';
+import { AuditStore, utcDayStamp } from './audit.js';
 import {
   protoTypes, buildRpcRequest, encodeRoutePush, handleRpcRequest, handleRpcResponse,
 } from './rpc.js';
@@ -34,6 +38,10 @@ import { bytesToHex, randomBytes } from './siphash.js';
 
 const WS_OPEN = 1;
 const STATE_KEY = 'room_state';
+/** v1.7 D5：kill 日计数持久化键（UTC 日重置，挂 flush/alarm 节奏） */
+const KILLS_KEY = 'kills_today';
+/** v1.7 A5：无凭证自计数持久化键（UTC 日重置；有凭证部署不使用但仍持久化，开销可忽略） */
+const SELF_COUNT_KEY = 'self_count';
 const BOOT_KEY = 'room_boot';
 const ATTACH_SYNC_INTERVAL_MS = 5000;
 const RETRY_AFTER_SEC = '60'; // 403/429 响应建议客户端退避时长（秒）
@@ -52,6 +60,31 @@ const TRENDS_BUCKET_SEC = { '24h': 900, '7d': 3600 }; // 24h→15min 桶（96 �
 function str(env, key, def) {
   const v = env && env[key];
   return v === undefined || v === null || v === '' ? def : String(v);
+}
+
+/**
+ * 房间 id 解析（v1.7 A3 自 index.js 收口到本模块：审计 KV 键房间段与 DO 命名
+ * 必须同源——单一事实源在 room.js，Worker 入口 import 复用，零循环依赖）。
+ * 优先级：Header > Query 参数 > env 默认值。
+ * v1.7 复核修复：统一 trim + 长度上限（KV 键 512 字节约束）——空/超长/纯空白
+ * 值回落默认，避免「Worker 用 ' ' 建 DO、审计段却归一成 global」的错位。
+ */
+export function resolveRoomId(request, url, env) {
+  const pick = (v) => {
+    const s = String(v ?? '').trim();
+    return s && s.length <= 128 ? s : '';
+  };
+  const headerName = str(env, 'ROOM_HEADER', '');
+  if (headerName) {
+    const v = pick(request.headers.get(headerName));
+    if (v) return v;
+  }
+  const queryName = str(env, 'ROOM_QUERY', '');
+  if (queryName) {
+    const v = pick(url.searchParams.get(queryName));
+    if (v) return v;
+  }
+  return pick(str(env, 'ROOM_ID', 'global')) || 'global';
 }
 
 function bool(env, key, def) {
@@ -99,7 +132,11 @@ export function buildConfig(env) {
     serverPeerId: int(env, 'SERVER_PEER_ID', 10000001) >>> 0,
     serverNetworkName: str(env, 'SERVER_NETWORK_NAME', 'public_server'),
     serverHostname: str(env, 'SERVER_HOSTNAME', 'easytier-cf-relay'),
-    serverVersionStr: str(env, 'SERVER_VERSION_STR', 'easytier-cf-relay/1.6.2'),
+    serverVersionStr: str(env, 'SERVER_VERSION_STR', 'easytier-cf-relay/1.7.0'),
+    // 房间 id 的 env 级默认（v1.7 A3）：DO 命名由 index.js resolveRoomId 解析
+    // （Header > Query > 此值）；本值还决定审计 KV 键的房间段。未分片部署恒为
+    // 'global'（ROOM_HEADER/QUERY 未配置时 resolveRoomId 也落到此值，两处同源）。
+    roomId: str(env, 'ROOM_ID', 'global'),
     avoidRelayData: bool(env, 'AVOID_RELAY_DATA', true),
     relayData: bool(env, 'RELAY_DATA', true),
     maxPeersPerRoom: int(env, 'MAX_PEERS_PER_ROOM', 64),
@@ -195,7 +232,7 @@ export class RelayRoom {
       );
     }
     this.pm = new PeerManager(this.config);
-    // KV 审计：记录（每类一条 KV 键）+ 黑名单（每类一条 KV 键）
+    // KV 审计：记录（每类一条 KV 键，v1.7 A3 起带房间段）+ 黑名单（每类一条 KV 键）
     this.audit = new AuditStore({
       kv: env && env.AUDIT_KV ? env.AUDIT_KV : null,
       storage: state.storage,
@@ -206,6 +243,7 @@ export class RelayRoom {
       adminAuditLimit: this.config.adminAuditLimit,
       ipMask: this.config.auditIpMask,
       retentionDays: this.config.auditRetentionDays,
+      roomId: this.config.roomId,
       log: this.log,
     });
     this.types = protoTypes();
@@ -238,10 +276,49 @@ export class RelayRoom {
       squatSuspect: 0,
       // 落盘降级次数（超预算丢 raw / 裁剪条目）
       flushDegraded: 0,
+      // ---- 额度韧性可观测（v1.7 A4/C5/D5，全部内存计数零写入开销）----
+      // KV 镜像写失败次数（按失败批内键数计；配额/网络异常时增长，失败键下轮重试）
+      kvWriteFailed: 0,
+      // KV 写日预算跳过键次（KV_WRITE_DAILY_BUDGET=900 耗尽时按牺牲序跳低优 rec 键）
+      kvWriteBudgetSkipped: 0,
+      // 今日 kill 计数（DO 口径：4008 速率限流断开 + DO 层黑名单握手拒绝；
+      // 边缘层 403 不经过 DO 不计数；UTC 日重置，DO storage 持久化随 DO 重启保留）
+      killsToday: 0,
+      // RPC 分片重组完成次数（v1.7 B9：官方客户端大 RPC 自动切片，本端收齐重组）
+      rpcPieceMerged: 0,
+      // RPC 分片校验拒绝/超预算/超限淘汰次数（v1.7 B9：total_pieces 越界等畸形分片流）
+      rpcPieceDropped: 0,
+      // 限流违规自动临时拉黑次数（v1.7 C4：观察窗触发 blacklistAdd socket 类）
+      autoBlacklisted: 0,
+      // 转发放行次数（v1.7 B10：from ≠ 连接身份且被声称身份非直连——官方多跳
+      // 转发语义；确证伪造走 forgeries，本计数只记合法转发放行）
+      forwardedFrom: 0,
     };
+    // v1.7 D5：AuditStore 上报 KV 写失败/预算跳过到宿主计数器
+    // （audit 先于 counters 构造，构造后补挂引用）
+    this.audit.counters = this.counters;
     this.startedAt = Date.now();
     this._dirty = false;
     this._storageFlushAt = 0;
+    // v1.7 B9：RPC 分片重组在途事务表（官方 PacketMerger；经 _rpcCtx 供 rpc 层读写）
+    this.rpcMerger = new Map();
+    // v1.7 D5：kill 日计数持久化锚点 / v1.7 C5：黑名单降级重试节流锚点
+    this._killsDirty = false;
+    this._killsDate = null;
+    this._lastBlReloadAt = 0;
+    // v1.7 A3：审计 init 惰性化锚点——audit.init()（KV 恢复读键）必须在房间段
+    // 就位后执行：fetch() 先解析房间（setRoomId）再触发本 promise；
+    // 构造期的 _init 不再直接 init 审计（alarm 等无请求路径的 flush 对未初始化
+    // 审计是自然 no-op：_kvDirty/_storageDirty 均为空）。
+    this._auditInitPromise = null;
+    // v1.7 A5：额度 shed 检查锚点（15 分钟门控）+ 无凭证自计数（UTC 日重置，
+    // killsToday 同款持久化三件套；多 isolate 有误差——宁误 shed，管理页可手动清除）
+    this._lastShedCheckAt = 0;
+    this._selfCount = { date: utcDayStamp(), msgs: 0, conns: 0, alarms: 0 };
+    this._selfCountDirty = false;
+    // v1.7 C4：限流违规观察窗（ip -> 4008 断开时间戳数组；10 分钟滑动窗，
+    // DO 内存不持久化——DO 重启清窗可接受，自动拉黑本身持久于黑名单）
+    this._killWindow = new Map();
     this._initPromise = this._init().catch((e) => {
       this.log.error(`init failed: ${e && e.stack || e}`);
     });
@@ -270,11 +347,41 @@ export class RelayRoom {
     } catch (e) {
       this.log.warn(`load boot time failed: ${e.message}`);
     }
-    // 4) 审计存储初始化 + PeerManager 事件挂接
-    await this.audit.init();
+    // 4) 审计存储初始化已惰性化（v1.7 A3）——audit.init() 由 _ensureAuditInit()
+    //    在房间段就位（fetch 解析房间之后）触发；PeerManager 事件挂接不依赖它。
+    // v1.7 D5：kill 日计数恢复（UTC 日重置；DO 重启不丢当日计数）
+    this._killsDate = utcDayStamp();
+    try {
+      const k = await this.state.storage.get(KILLS_KEY);
+      if (k && k.date === this._killsDate && Number(k.count) >= 0) {
+        this.counters.killsToday = Number(k.count);
+      }
+    } catch { /* 恢复失败按 0 起算 */ }
+    // v1.7 A5：无凭证自计数恢复（UTC 日重置；DO 重启不丢当日粗估）
+    try {
+      const sc = await this.state.storage.get(SELF_COUNT_KEY);
+      if (sc && sc.date === utcDayStamp()
+        && Number.isFinite(sc.msgs) && Number.isFinite(sc.conns) && Number.isFinite(sc.alarms)) {
+        this._selfCount = { date: sc.date, msgs: Number(sc.msgs), conns: Number(sc.conns), alarms: Number(sc.alarms) };
+      }
+    } catch { /* 恢复失败按 0 起算 */ }
     this.pm.onEvent = (ev) => this._onPmEvent(ev);
     // 5) 确保清扫 alarm 存在
     await this._ensureAlarm();
+  }
+
+  /**
+   * v1.7 A3：审计初始化（惰性、单次）——KV 恢复读键以「调用时刻的房间段」为准，
+   * 因此必须在 fetch() 解析房间（audit.setRoomId）之后调用。构造期不再直接
+   * init，避免分片部署（ROOM_HEADER/QUERY）在房间未知时从默认房间键恢复。
+   */
+  async _ensureAuditInit() {
+    if (!this._auditInitPromise) {
+      this._auditInitPromise = this.audit.init().catch((e) => {
+        this.log.warn(`audit init failed: ${e && e.message}`);
+      });
+    }
+    await this._auditInitPromise;
   }
 
   /** PeerManager 事件 → KV 审计记录 */
@@ -335,8 +442,20 @@ export class RelayRoom {
   // -------------------------------------------------------------------
 
   async fetch(request) {
-    await this._initPromise;
+    // v1.7 A3：房间段先于一切审计操作就位——resolveRoomId 与 Worker 入口同源
+    // （Header > Query > env ROOM_ID），未分片部署两处恒同值（setRoomId 幂等）；
+    // 分片部署由此保证 audit.init()（KV 恢复读键）落在正确房间的键上。
     const url = new URL(request.url);
+    // v1.7 复核修复：内部端点（仅 Worker 鉴权后转发；Upgrade+内部路径组合另有
+    // 404 守卫，客户端不可直达）采信 Worker 注入的房间头——否则分片部署的
+    // 内部请求无房间线索，DO 会回退 env 默认房间并跨房间写审计键；
+    // WS 升级路径忽略该头（客户端可伪造，须走 resolveRoomId 的 Header/Query 规则）
+    const internalRoom = url.pathname.startsWith('/internal/')
+      ? String(request.headers.get(ROOM_HEADER_INTERNAL) || '').trim()
+      : '';
+    this.audit.setRoomId(internalRoom || resolveRoomId(request, url, this.env));
+    await this._initPromise;
+    await this._ensureAuditInit();
     const path = url.pathname;
 
     // v1.4.1 安全修复：内部端点只接受 index.js 鉴权后的改写转发（无 Upgrade 头）。
@@ -421,8 +540,23 @@ export class RelayRoom {
     if (path === '/internal/blacklist/delete' && request.method === 'POST') {
       const body = await this._readBody(request);
       const r = this.audit.blacklistRemove(body.cat, body.ids);
+      // v1.7 C4：socket 类解除拉黑 → 清该 IP 的限流违规观察窗（解除 = 重新观察，
+      // 否则旧 4008 记录会在下次限流时立即触发二次自动拉黑）
+      if (body.cat === 'socket' && Array.isArray(r.values)) {
+        for (const v of r.values) this._killWindow.delete(String(v));
+      }
       await this._adminOp(adminIp, 'blacklist-remove', { cat: body.cat, removed: r.removed || 0 });
       return Response.json(r);
+    }
+    // 额度 shed 手动清除（v1.7 A5）：清除 KV 标记 + 复位当日自计数
+    //（不复位则下一轮 15 分钟检查立即重新激活——管理员清除即明确接受风险）
+    if (path === '/internal/shed/clear' && request.method === 'POST') {
+      const changed = await this.audit.setShedFlag(false);
+      this._selfCount = { date: utcDayStamp(), msgs: 0, conns: 0, alarms: 0 };
+      this._selfCountDirty = true;
+      this.log.warn(`quota shed manually cleared by admin (was ${changed ? 'active' : 'inactive'})`);
+      await this._adminOp(adminIp, 'shed-clear', {});
+      return Response.json({ ok: true, changed });
     }
     if (path === '/internal/group/delete' && request.method === 'POST') {
       const body = await this._readBody(request);
@@ -502,6 +636,17 @@ export class RelayRoom {
       }
     }
 
+    // v1.7 A5：额度 shed——DO 层兜底拒绝新升级（边缘层 KV 标记未生效/未绑定
+    // AUDIT_KV 时由此拦截）。与 per-IP 429 同形态零指纹；已建立的 Hibernation
+    // 会话不走本路径（不吃 Worker 请求额度，存量 mesh 跑到当日复位）。
+    if (this.audit.shedActive) {
+      this.log.warn('connection rejected (quota shed active)');
+      return new Response('Too many requests', {
+        status: 429,
+        headers: { 'retry-after': '300' },
+      });
+    }
+
     const pair = new WebSocketPair();
     const [client, server] = [pair[0], pair[1]];
     this._acceptSocket(server, clientIp);
@@ -536,6 +681,7 @@ export class RelayRoom {
     ws._serverPingSent = false;
     this._saveAttachment(ws, now);
     this.counters.connsTotal += 1;
+    this._selfCountInc('conns'); // v1.7 A5：无凭证自计数（升级接受 = 1 个 DO 请求）
     this.audit.record('sockets', {
       event: 'open', socketId: ws._socketId, ...(ws._clientIp ? { ip: ws._clientIp } : {}),
     });
@@ -626,6 +772,9 @@ export class RelayRoom {
 
   async webSocketMessage(ws, message) {
     await this._initPromise;
+    // v1.7 A3：Hibernation 唤醒可能不经过 fetch（DO 代际首个消息）——审计
+    // 惰性 init 在此兜底（房间段为构造期默认值；分片部署建议仅用 ROOM_ID）
+    await this._ensureAuditInit();
     let buf;
     if (message instanceof ArrayBuffer) {
       buf = new Uint8Array(message);
@@ -641,6 +790,7 @@ export class RelayRoom {
     const now = Date.now();
     this._touch(ws, now);
     this.counters.msgsIn += 1;
+    this._selfCountInc('msgs'); // v1.7 A5：无凭证自计数（入站消息 20:1 折算请求）
     this.counters.bytesIn += buf.length;
 
     // 单连接消息速率限制（v1.5，事前限流）：固定 1s 窗口计数，持续超限断开。
@@ -652,7 +802,14 @@ export class RelayRoom {
       }
       ws._rateCount = (ws._rateCount || 0) + 1;
       if (ws._rateCount > this.config.msgRateLimitPerSec) {
+        // v1.7 C4：断开指令发出后，运行时仍会投递该连接缓冲的残余消息——不去重
+        // 会把「一次断开」重复记账（rateLimited/killsToday/C4 观察窗各爆表，
+        // 观察窗会从 1 次断开瞬间凑满 AUTO_BLACKLIST_KILLS 触发误拉黑）
+        if (ws._rateKilled) return;
+        ws._rateKilled = true;
         this.counters.rateLimited += 1;
+        this._killInc();
+        this._noteRateLimitKill(ws._clientIp); // v1.7 C4：观察窗记录 + 阈值自动拉黑
         this.log.warn(
           `rate limit exceeded: peer=${ws._peerId} count=${ws._rateCount}/${this.config.msgRateLimitPerSec}/s`
         );
@@ -688,19 +845,53 @@ export class RelayRoom {
       }
     }
 
-    // v1.4.2 安全修复（外部安全加固）：发往服务端的 RPC 不经过 _forward
-    // 的源校验——统一门禁：a) 未握手不处理控制面 RPC（阻断匿名连接驱动路由
-    // 会话状态机）；b) fromPeerId 必须与连接注册身份一致（阻断冒名 SyncRouteInfo
-    // 以 direct 自报覆盖任意在线节点路由、冒名 ReportPeers 覆盖 PeerCenter
-    // 直连表、伪造 RpcResp 清空会话强制全量重推）。官方客户端恒以自身
-    // peerId 为 from，不破坏兼容；与 _forward 的身份校验同一规则。
+    // v1.4.2 安全修复（外部安全加固）：未握手不处理任何 RPC（V-03 不退，
+    // 匿名连接既不能驱动路由会话状态机、也不允许经其转发）；from ≡ 连接身份校验
+    // 按 v1.7 B10 改为【直连在线判据】：fromPeerId ≠ 连接身份时——
+    // a) 被声称身份在本组【直连在线】（有自己的连接）→ 确证伪造：该身份不可能
+    //    经由他人连接发话，丢弃 + forgeries（冒名 SyncRouteInfo / 冒名
+    //    ReportPeers / 伪造 RpcResp 清会话 防线不退）；
+    // b) 被声称身份【非直连】→ 官方多跳转发语义放行（转发保持原始 from，官方
+    //    非 secure 模式无连接身份校验）：生产 2026-11-21 实锤的父节点替子节点
+    //    转发形态（drop forged rpc ×63，conn_peer 6 连接、claims 9+ PeerId）
+    //    即此类，v1.4.2 的无差别校验把子节点密集网络的 RPC 全部丢弃。
+    //    残余暴露面 = 非直连身份可被同组连接冒名（与官方语义等同，端到端加密
+    //    在客户端层；收紧路径 NETWORK_SECRETS / secure mode——技术文档安全边界）。
     if (header.packetType === PacketType.RpcReq || header.packetType === PacketType.RpcResp) {
       if (ws._peerId == null) return;
-      if (header.fromPeerId !== ws._peerId) {
+      // v1.7 复核修复：本地会话态 RPC 路径同步补冒充中继自身 / 非法 from 的硬拒
+      //（v1.4.2 的 from≡身份防线被 B10 放宽后，serverPeerId 恒非直连会被当成
+      // 「非直连多跳」放行，可注入 PeerCenter/伪路由；_forward 侧本已有硬拒）
+      if (header.fromPeerId !== ws._peerId
+          && (header.fromPeerId === this.config.serverPeerId
+            || header.fromPeerId <= 0
+            || this._isDirectlyConnected(ws, header.fromPeerId))) {
         this.counters.forgeries += 1;
         this.log.warn(`drop forged rpc: conn_peer=${ws._peerId} claims from=${header.fromPeerId} type=${header.packetType}`);
         return;
       }
+      if (header.fromPeerId !== ws._peerId) {
+        this.counters.forwardedFrom += 1;
+        this.log.info(`forward-from rpc: conn_peer=${ws._peerId} claims from=${header.fromPeerId} type=${header.packetType}`);
+      }
+    }
+
+    // v1.7 B4：官方 liveness 数据面语义（peer_conn_liveness.rs:132-176）——
+    // PROBE/ECHO 共用 header reserved 字节作 token，标记消费即清除、不跨跳传播：
+    // 收到 PROBE → 在本连接排队 echo（附着到下一个经 _send 的出站包，官方
+    // before_send 同款）；收到 ECHO → 客户端确认探针（服务端无动作）。
+    // 两标记位与 reserved 在缓冲区一并清除——本地分发与 _forward 透传均不再
+    // 携带（官方 after_received 同款，转发的包不向下游传播探针）。
+    const lvMask = HeaderFlags.LIVENESS_PROBE | HeaderFlags.LIVENESS_ECHO;
+    if (header.flags & lvMask) {
+      if (header.flags & HeaderFlags.LIVENESS_PROBE) {
+        ws._pendingEchoToken = header.reserved & 0xff;
+        ws._pendingEchoValid = true;
+      }
+      buf[9] = header.flags & ~lvMask;
+      buf[11] = 0;
+      header.flags = buf[9];
+      header.reserved = 0;
     }
 
     // 按 header.len 截断——官方语义 len = payload 长度，
@@ -762,6 +953,10 @@ export class RelayRoom {
 
   async webSocketClose(ws, code, reason, wasClean) {
     await this._initPromise;
+    // v1.7 复核修复：close/error 可能是一个 DO 代际的首个事件（Hibernation 驱逐
+    // 后无 fetch）——必须先完成审计 init（KV/storage 恢复），否则 record() 置脏
+    // 后 flush 会用未恢复的空快照覆盖 audit_state 与 KV 镜像
+    await this._ensureAuditInit();
     this.audit.record('sockets', {
       event: 'close', socketId: ws._socketId ?? null, peerId: ws._peerId ?? null,
       ...(ws._clientIp ? { ip: ws._clientIp } : {}), code,
@@ -771,6 +966,7 @@ export class RelayRoom {
 
   async webSocketError(ws) {
     await this._initPromise;
+    await this._ensureAuditInit(); // v1.7 复核修复：同 webSocketClose
     this.audit.record('sockets', {
       event: 'error', socketId: ws._socketId ?? null, peerId: ws._peerId ?? null,
       ...(ws._clientIp ? { ip: ws._clientIp } : {}),
@@ -832,6 +1028,7 @@ export class RelayRoom {
       if (bl.blocked) {
         // v1.3.0：拒绝不写入 peers 记录（防重连风暴刷爆记录列表），只计数
         this.counters.blRejected += 1;
+        this._killInc();
         this.log.warn(
           `handshake rejected (blacklist:${bl.cat}) network="${networkName}" peer=${peerId} value=${bl.value}`
         );
@@ -951,25 +1148,45 @@ export class RelayRoom {
   }
 
   _handlePing(ws, header, payload) {
-    // 回显 Pong；若客户端使用 liveness-echo 探针（flags 带 token），镜像 flags
-    const flags = header.flags & HeaderFlags.LIVENESS_ECHO;
+    // 回显 Pong；liveness 探针回显由 _send 统一附着（v1.7 B4：token 机制取代
+    // 旧的无 token 镜像——探针方以 reserved 字节比对 token，无 token 的镜像无效）
     this._send(ws, buildPacket(
       this.config.serverPeerId, header.fromPeerId, PacketType.Pong,
-      payload, { flags }
+      payload
     ));
+  }
+
+  /**
+   * v1.7 B10：直连在线判据——被声称身份是否在本组有自己的连接。
+   * 在线 → from ≠ 连接身份的包必属伪造（该身份有直连，不经他人连接发话）；
+   * 非在线 → 官方多跳转发语义放行（父节点替子节点转发，原始 from 保持）。
+   */
+  _isDirectlyConnected(ws, peerId) {
+    if (peerId == null) return false;
+    return !!this.pm.getPeer(ws._groupKey, peerId);
   }
 
   _forward(ws, header, fullMessage) {
     if (ws._groupKey == null) return; // 未握手连接不允许转发
-    // 加固：转发前校验源身份。包内 from_peer_id 必须与连接注册的
-    // peerId 一致，否则视为伪造（丢弃并计数），防源地址欺骗。
+    // 加固：转发前源身份校验。from ≡ 连接身份照常转发；
+    // from ≠ 连接身份时——冒充中继自身（from=serverPeerId）或被声称身份在本组
+    // 直连在线 → 确证伪造（丢弃 + forgeries， 防线不退）；否则按官方
+    // 多跳转发语义放行（原始 from 保持，转发不产生额外身份改写——官方行为）。
     if (header.fromPeerId !== ws._peerId) {
-      this.counters.forgeries += 1;
-      this.log.warn(
-        `drop forged packet: conn_peer=${ws._peerId} claims from=${header.fromPeerId} ` +
+      if (header.fromPeerId === this.config.serverPeerId || header.fromPeerId <= 0
+          || this._isDirectlyConnected(ws, header.fromPeerId)) {
+        this.counters.forgeries += 1;
+        this.log.warn(
+          `drop forged packet: conn_peer=${ws._peerId} claims from=${header.fromPeerId} ` +
+          `to=${header.toPeerId} type=${header.packetType}`
+        );
+        return;
+      }
+      this.counters.forwardedFrom += 1;
+      this.log.info(
+        `forward-from packet: conn_peer=${ws._peerId} claims from=${header.fromPeerId} ` +
         `to=${header.toPeerId} type=${header.packetType}`
       );
-      return;
     }
     const target = this.pm.getPeer(ws._groupKey, header.toPeerId);
     if (!target || target === ws) return;
@@ -979,15 +1196,33 @@ export class RelayRoom {
       this.log.debug(`drop packet: forward counter exceeded (type=${header.packetType})`);
       return;
     }
+    // v1.7 复核修复：转发出站同样经 _attachEcho 附着待回显 token（官方
+    // before_send 覆盖该连接的一切出站包，含转发的数据/控制帧）
+    const framed = this._attachEcho(target, out);
     try {
-      target.send(out);
+      target.send(framed);
       this.counters.forwards += 1;
       this.counters.msgsOut += 1;
-      this.counters.bytesOut += out.length;
+      this.counters.bytesOut += framed.length;
     } catch (e) {
       this.log.warn(`forward to ${header.toPeerId} failed: ${e.message}`);
       this._cleanupPeer(target, 'send-failed');
     }
+  }
+
+  /**
+   * v1.7 B4 / 复核修复：liveness echo 附着（官方 peer_conn_liveness.rs before_send
+   * 同款）——本连接有待回显 token 时，将其附到下一个出站包（ECHO 位 + reserved
+   * 字节），一次性消费。_send 与 _forward 共用，覆盖一切出站路径。
+   */
+  _attachEcho(ws, bytes) {
+    if (!ws || ws._pendingEchoValid !== true) return bytes;
+    ws._pendingEchoValid = false;
+    const out = bytes.slice();
+    out[9] = (out[9] & ~(HeaderFlags.LIVENESS_PROBE | HeaderFlags.LIVENESS_ECHO))
+      | HeaderFlags.LIVENESS_ECHO;
+    out[11] = ws._pendingEchoToken & 0xff;
+    return out;
   }
 
   _send(ws, bytes) {
@@ -996,6 +1231,8 @@ export class RelayRoom {
     // 「分组条目上限 × 单条字节上限 < 本上限」自洽不变量保护（128×768B=96KB），
     // 永不触发本闸；触发即说明状态被异常注入，丢弃并计数（不关闭连接：
     // 毒状态由分组条目上限与老化负责清除）。
+    // v1.7 复核修复：大小闸前移——echo 附着会消费 token，若先附着后丢帧，
+    // 探针回显会被吞掉（echo 不改变长度，重排无副作用）
     if (bytes.length > this.config.maxMessageBytes) {
       this.counters.outboundDropped += 1;
       this.log.warn(
@@ -1003,6 +1240,10 @@ export class RelayRoom {
       );
       return;
     }
+    // v1.7 B4：待回显 token 附着到本连接下一个出站包（探针后的第一个出站包
+    // 通常就是 Pong）；旧实现（_handlePing 镜像 ECHO 位但不带 token）是残缺
+    // 回显，本机制取代之
+    bytes = this._attachEcho(ws, bytes);
     try {
       ws.send(bytes);
       this.counters.msgsOut += 1;
@@ -1094,6 +1335,7 @@ export class RelayRoom {
       config: this.config,
       log: this.log,
       counters: this.counters,
+      rpcMerger: this.rpcMerger, // v1.7 B9：RPC 分片重组在途事务表
       send: (ws, bytes) => this._send(ws, bytes),
       pushRoute: (ws, forceFull) => this._pushRoute(ws, forceFull),
       broadcast: (groupKey, excludePeerId) => this._broadcast(groupKey, excludePeerId),
@@ -1115,11 +1357,126 @@ export class RelayRoom {
   // Alarm：清扫 + 持久化
   // -------------------------------------------------------------------
 
+  /**
+   * v1.7 D5：kill 日计数（DO 口径）+1——UTC 日惰性重置，持久化挂 flush/alarm
+   * 节奏（非逐次）。计数点：速率限流 4008 断开 + DO 层黑名单握手拒绝；
+   * 边缘层 403 拒绝不经过 DO，不在此计数（与 blRejected 同口径边界）。
+   */
+  _killInc() {
+    const today = utcDayStamp();
+    if (this._killsDate !== today) {
+      this._killsDate = today;
+      this.counters.killsToday = 0;
+    }
+    this.counters.killsToday += 1;
+    this._killsDirty = true;
+  }
+
+  /**
+   * v1.7 C4：限流违规观察窗（单 IP 10 分钟滑动窗，DO 内存）——4008 断开即记录；
+   * 窗内 ≥ AUTO_BLACKLIST_KILLS 次 → 自动对肇事 IP 拉黑（blacklistAdd socket 类，
+   * reason 前缀 'auto rate-limit'，管理页黑名单可见、可一键解除）。
+   * - 口径：仅统计 4008 速率限流断开（规划原文「4008/403」收窄——4013/403 命中者
+   *   已在黑名单，无循环可言，计入窗口无增益；评估结论见规划文档 C4）；
+   * - KV 写限幅评估结论：无需独立限幅器——自动路径走既有 10 分钟 flush 节奏
+   *   （bl:socket ≤6 写/小时，天然满足 ≤30/小时）+ A4 日预算封顶；
+   * - 解除拉黑时清窗（/internal/blacklist/delete 路由）= 给该 IP 重新观察的机会。
+   */
+  _noteRateLimitKill(ip) {
+    if (!ip) return; // 本地 dev 无 CF-Connecting-IP / 极端环境缺头：不观察
+    const now = Date.now();
+    let arr = this._killWindow.get(ip);
+    if (!arr) {
+      if (this._killWindow.size >= AUTO_BLACKLIST_WINDOW_MAX_IPS) {
+        const oldest = this._killWindow.keys().next().value;
+        this._killWindow.delete(oldest); // FIFO 驱逐最旧 IP（防轮换 IP 撑爆内存）
+      }
+      arr = [];
+      this._killWindow.set(ip, arr);
+    }
+    while (arr.length && now - arr[0] > AUTO_BLACKLIST_WINDOW_MS) arr.shift(); // 滑动窗修剪
+    arr.push(now);
+    if (arr.length < AUTO_BLACKLIST_KILLS) return;
+    // 触发自动拉黑（blacklistAdd 幂等：已存在条目只刷新 ts/reason）
+    const r = this.audit.blacklistAdd('socket', ip, {
+      reason: `auto rate-limit: ${arr.length} kills/${AUTO_BLACKLIST_WINDOW_MS / 60_000}min`,
+    });
+    if (r && r.ok) {
+      this.counters.autoBlacklisted += 1;
+      this.log.warn(
+        `auto rate-limit blacklist: ip=${ip} kills=${arr.length}/${AUTO_BLACKLIST_KILLS} `
+        + `in ${AUTO_BLACKLIST_WINDOW_MS / 60_000}min${r.existed ? ' (refreshed)' : ''}`
+      );
+      arr.length = 0; // 拉黑后清窗（后续拒绝发生在升级/握手层，不再计入 4008 窗）
+    }
+  }
+
+  /**
+   * v1.7 A5：无凭证自计数增量（UTC 日惰性重置，killsToday 同款）。
+   * 口径 = 前端估算卡同款公式（msgsIn/20 + conns + alarms，20:1 入站消息折算），
+   * 多 isolate 有误差——宁误 shed（当日复位即恢复、管理页可手动清除）不漏 shed。
+   */
+  _selfCountInc(field) {
+    const today = utcDayStamp();
+    if (this._selfCount.date !== today) {
+      this._selfCount = { date: today, msgs: 0, conns: 0, alarms: 0 };
+    }
+    this._selfCount[field] += 1;
+    this._selfCountDirty = true;
+  }
+
+  /** v1.7 A5：无凭证自计数粗估（当日已用请求数估算；有凭证部署不使用本路径） */
+  _selfEstimate() {
+    const today = utcDayStamp();
+    if (this._selfCount.date !== today) {
+      this._selfCount = { date: today, msgs: 0, conns: 0, alarms: 0 };
+      return 0;
+    }
+    return Math.ceil(this._selfCount.msgs / 20) + this._selfCount.conns + this._selfCount.alarms;
+  }
+
+  /**
+   * v1.7 A5：额度 shed 检查（alarm 内 15 分钟门控调用）。
+   * 有凭证（CF_ACCOUNT_ID + CF_API_TOKEN）→ GraphQL 账号当日真实用量
+   * （复用额度卡链路 _fetchQuota，出站调用不吃入站请求额度）；
+   * 无凭证 → DO 自计数粗估（_selfEstimate）。
+   * 滞回：≥90% 激活、<85% 清除；查询失败/形状异常不动作（不误清也不误激活）。
+   */
+  async _checkQuotaShed() {
+    // v1.7 复核修复：shed 键 KV 写失败后的幂等重试（每轮检查一次，非脏零开销）
+    await this.audit.retryShedKvIfDirty();
+    const account = this.config.cfAccountId;
+    const token = this.config.cfApiToken;
+    let usage = null;
+    if (account && token) {
+      const r = await this._fetchQuota(account, token, Date.now());
+      // v1.7 复核修复：阈值口径只用 requests 单维——errors 是 requests 的子集
+      // （再加一次属重复计数）、subrequests 不是 Workers 10 万请求配额的维度；
+      // 三者相加会让阈值提前约一倍触发。subrequests/errors 仍在额度卡展示。
+      if (r && r.source === 'cloudflare') usage = Number(r.requests) || 0;
+    } else {
+      usage = this._selfEstimate();
+    }
+    if (usage == null) return;
+    const limit = FREE_DAILY_REQUESTS;
+    if (!this.audit.shedActive && usage >= limit * SHED_ACTIVATE_RATIO) {
+      await this.audit.setShedFlag(true);
+      this.log.warn(`quota shed ACTIVATED: usage=${usage}/${limit} (>=${SHED_ACTIVATE_RATIO * 100}%) — new connections rejected until usage drops or UTC reset`);
+    } else if (this.audit.shedActive && usage < limit * SHED_RESUME_RATIO) {
+      await this.audit.setShedFlag(false);
+      this.log.info(`quota shed cleared: usage=${usage}/${limit} (<${SHED_RESUME_RATIO * 100}%)`);
+    }
+  }
+
   async alarm() {
     await this._initPromise;
+    // v1.7 复核修复：alarm 可能是 DO 代际的首个事件（持久化闹钟唤醒、无 fetch）——
+    // 审计必须在任何 record/flush 之前完成恢复，否则快照会被未初始化数据覆盖
+    await this._ensureAuditInit();
     const now = Date.now();
     const cfg = this.config;
     this.counters.alarmCount = (this.counters.alarmCount || 0) + 1; // v1.5 额度估算用
+    this._selfCountInc('alarms'); // v1.7 A5：无凭证自计数（alarm 每次 = 1 个 DO 请求）
     this._maybeWriteDot(now); // v1.6 A5：AE 趋势打点（≥60s 一次，未绑定 AE 静默跳过）
 
     for (const ws of this.state.getWebSockets()) {
@@ -1186,6 +1543,52 @@ export class RelayRoom {
       await this.audit.flush(now);
     }
 
+    // v1.7 C5：黑名单降级恢复——init 时 KV 恢复失败则按 60s 节流重试
+    //（成功即清除降级态；仅降级态存在，读配额 ≤5,760/天，评估见规划 §3 补录）
+    if (this.audit.blDegraded && now - this._lastBlReloadAt >= 60_000) {
+      this._lastBlReloadAt = now;
+      await this.audit.reloadBlacklists();
+    }
+
+    // v1.7 A5：额度 shed 检查（15 分钟门控，≤96 次/天；有凭证走 GraphQL 账号用量，
+    // 无凭证回退自计数粗估——评估见规划 §3「额度影响评估补录」）
+    if (now - (this._lastShedCheckAt || 0) >= SHED_CHECK_MS) {
+      this._lastShedCheckAt = now;
+      try {
+        await this._checkQuotaShed();
+      } catch (e) {
+        this.log.warn(`quota shed check failed: ${e && e.message}`);
+      }
+    }
+
+    // v1.7 D5：kill 日计数持久化（UTC 日重置；挂 flush/alarm 节奏，非逐次）
+    if (this._killsDirty) {
+      try {
+        await this.state.storage.put(KILLS_KEY, {
+          date: this._killsDate || utcDayStamp(),
+          count: this.counters.killsToday,
+        });
+        this._killsDirty = false;
+      } catch (e) {
+        this.log.warn(`persist kills today failed: ${e.message}`);
+      }
+    }
+
+    // v1.7 A5：无凭证自计数持久化（同 killsToday 节奏；storage 不计请求数）
+    if (this._selfCountDirty) {
+      try {
+        await this.state.storage.put(SELF_COUNT_KEY, this._selfCount);
+        this._selfCountDirty = false;
+      } catch (e) {
+        this.log.warn(`persist self count failed: ${e.message}`);
+      }
+    }
+
+    // v1.7 B9：RPC 重组事务 TTL 扫描（官方 server 10s 同款；feed 路径另有懒扫兜底）
+    for (const [k, e] of this.rpcMerger) {
+      if (now - e.lastAt > RPC_MERGER_TTL_MS) this.rpcMerger.delete(k);
+    }
+
     // 重新挂 alarm（自适应排程：有连接时对齐最近的 socket 事件时刻，
     // 完全空闲时退避到 sweepIdleIntervalMs，见 _nextAlarmDelay）
     try {
@@ -1223,7 +1626,9 @@ export class RelayRoom {
     if (earliest !== Infinity) {
       return Math.max(1_000, Math.min(cfg.sweepIntervalMs, earliest - now));
     }
-    if (this._dirty || this.audit.isDirty()) return cfg.sweepIntervalMs;
+    // v1.7 复核修复：用 hasFlushableDirty——A4 预算跳过键（等待次日）不应把
+    // 空闲房间从 idle 退避拉回 15s 节奏（否则 5,760 请求/天，抵消 A4/A5 目的）
+    if (this._dirty || this.audit.hasFlushableDirty()) return cfg.sweepIntervalMs;
     const idle = cfg.sweepIdleIntervalMs > 0 ? cfg.sweepIdleIntervalMs : cfg.sweepIntervalMs;
     return idle;
   }
@@ -1379,6 +1784,10 @@ export class RelayRoom {
         records: this.audit._counts(),
         blacklist: this.audit.blacklistCounts(),
         kvEnabled: !!this.audit.kv,
+        // v1.7 复核修复：A4 预算视图补齐——管理页统计卡读 s.audit.kvBudget，
+        // 此前只有 /internal/stats 的 _stats() 提供，/api/state 缺字段导致
+        // 页面恒显示 fallback 值（0/900）
+        kvBudget: { ...this.audit.kvBudget, budget: KV_WRITE_DAILY_BUDGET },
       };
     }
     return {
@@ -1388,6 +1797,10 @@ export class RelayRoom {
       uptimeSec: Math.floor((Date.now() - this.startedAt) / 1000),
       serverPeerId: this.config.serverPeerId,
       counters: this.counters,
+      // v1.7 复核修复：C5/D5/A5 降级态数据源补齐（管理页统计卡与 shed 横幅读
+      // s.blDegraded / s.shed；此前只在 _stats()/prometheus 提供）
+      blDegraded: !!this.audit.blDegraded,
+      shed: this.audit.shedActive === true,
       config: this._configView(),
     };
   }
@@ -1616,10 +2029,17 @@ export class RelayRoom {
       groups,
       counters: this.counters,
       sockets: this._socketCounts(),
+      // v1.7 D5：黑名单降级态（prometheus gauge easytier_blacklist_degraded / 总览红显）
+      blDegraded: !!this.audit.blDegraded,
+      // v1.7 A5：额度 shed 激活态（prometheus gauge easytier_shed_active / 总览红显 +
+      // 额度卡横幅；激活期间新连接被 429 拒绝，存量会话不受影响）
+      shed: this.audit.shedActive === true,
       audit: {
         kvEnabled: !!this.audit.kv,
         records: this.audit._counts(),
         blacklist: this.audit.blacklistCounts(),
+        // v1.7 A4：KV 写日预算用量（date=UTC 日戳 / used=尝试数 / budget=上限）
+        kvBudget: { ...this.audit.kvBudget, budget: KV_WRITE_DAILY_BUDGET },
       },
       // v1.6.0：config 对齐管理端白名单（此前仅 6 项，落后多个版本）
       config: this._configView(),

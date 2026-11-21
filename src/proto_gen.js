@@ -1,3 +1,11 @@
+/**
+ * 静态 Protobuf 模块（pbjs 生成，勿手改）——由 tools/regen_proto.sh 重新生成。
+ *
+ * proto 来源：EasyTier-official main@81487c363a56779e745eae927e130a813535c71e（2026-08-24T09:49:27+08:00 快照）；
+ * schema 与 easytier-core v2.7.0 等价，口径详见 docs/技术文档.md §4.2。
+ * 生成日期：2026-11-21
+ * 输入摘要：peer_rpc=4e6431a674b5 common=de7b0af74820 error=b188bc24d665
+ */
 /*eslint-disable block-scoped-var, id-length, no-control-regex, no-magic-numbers, no-mixed-operators, no-prototype-builtins, no-redeclare, no-shadow, no-var, sort-vars, default-case, jsdoc/require-param*/
 import $protobuf from "protobufjs/minimal.js";
 

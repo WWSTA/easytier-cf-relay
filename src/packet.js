@@ -43,7 +43,9 @@ export function parseHeader(buf) {
  * @param {number} toPeerId
  * @param {number} packetType
  * @param {Uint8Array} payload
- * @param {{flags?: number, forwardCounter?: number}} [opts]
+ * @param {{flags?: number, forwardCounter?: number, reserved?: number}} [opts]
+ *   reserved：v1.7 B4——liveness echo token（官方 peer_conn_liveness.rs：PROBE/ECHO
+ *   共用 reserved 字节作 token；默认 0，本端构造的包通常不携带）
  * @returns {Uint8Array}
  */
 export function buildPacket(fromPeerId, toPeerId, packetType, payload, opts = {}) {
@@ -56,7 +58,7 @@ export function buildPacket(fromPeerId, toPeerId, packetType, payload, opts = {}
   out[9] = (opts.flags ?? 0) & 0xff;
   // 官方语义：本端新构造的包 forward_counter 起始为 1（packet/mod.rs fill_peer_manager_hdr）
   out[10] = (opts.forwardCounter ?? 1) & 0xff;
-  out[11] = 0;
+  out[11] = (opts.reserved ?? 0) & 0xff;
   dv.setUint32(12, body.length, true);
   out.set(body, HEADER_SIZE);
   return out;

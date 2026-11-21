@@ -1,21 +1,21 @@
-# EasyTier Cloudflare Relay V1.6.2
+# EasyTier Cloudflare Relay V1.7.0
 
 在 Cloudflare Workers 免费额度内运行 EasyTier 自建 WebSocket 节点——无需 VPS，
 客户端 `-p wss://<你的域名>/` 即可组网。纯 P2P 优先（中继仅兜底），全 Hibernation API 空闲成本趋零。
 
-已用 easytier-core **2.6.4** 官方客户端实测：握手、路由同步、双节点互见、数据中继全部通过。
+已用 easytier-core 官方客户端实测（**2.6.4 / 2.7.0 / 2.7.1** 三版本探针结论一致）：握手、路由同步、双节点互见、数据中继全部通过。
+
 
 <div align="center">
 <img src="assets/icon.svg" width="110" alt="EasyTier Cloudflare Relay 图标"/>
 </div>
-
-[![版本](https://img.shields.io/badge/版本-v1.6.2-6699FF?style=flat-square)](docs/更新日志.md) [![Stars](https://img.shields.io/github/stars/WWSTA/easytier-cf-relay?style=flat-square&logo=github&label=Stars&color=ffcb2d)](https://github.com/WWSTA/easytier-cf-relay/stargazers) [![License](https://img.shields.io/github/license/WWSTA/easytier-cf-relay?style=flat-square&color=1a7f37)](LICENSE) [![平台](https://img.shields.io/badge/平台-Cloudflare_Workers-F6821F?style=flat-square&logo=cloudflare&logoColor=white)](https://workers.cloudflare.com/) [![实测](https://img.shields.io/badge/官方实测-easytier--core_2.6.4-1a7f37?style=flat-square)](docs/技术文档.md) [![语言](https://img.shields.io/badge/语言-JavaScript-f7df1e?style=flat-square&logo=javascript&logoColor=black)](#) [![Wrangler](https://img.shields.io/badge/Wrangler-v4-0969da?style=flat-square)](#)
+[![版本](https://img.shields.io/badge/版本-v1.7.0-6699FF?style=flat-square)](docs/更新日志.md) [![Stars](https://img.shields.io/github/stars/WWSTA/easytier-cf-relay?style=flat-square&logo=github&label=Stars&color=ffcb2d)](https://github.com/WWSTA/easytier-cf-relay/stargazers) [![License](https://img.shields.io/github/license/WWSTA/easytier-cf-relay?style=flat-square&color=1a7f37)](LICENSE) [![平台](https://img.shields.io/badge/平台-Cloudflare_Workers-F6821F?style=flat-square&logo=cloudflare&logoColor=white)](https://workers.cloudflare.com/) [![实测](https://img.shields.io/badge/官方实测-easytier--core_2.6.4---2.7.1-1a7f37?style=flat-square)](docs/技术文档.md) [![语言](https://img.shields.io/badge/语言-JavaScript-f7df1e?style=flat-square&logo=javascript&logoColor=black)](#) [![Wrangler](https://img.shields.io/badge/Wrangler-v4-0969da?style=flat-square)](#)
 
 本项目使用了**国模**进行全栈开发。虽然与国模进行了不少友好交流，但是可能仍然有一些不影响使用的特性，下个版本会继续修，欢迎各位有想法的fork修理。（免费的白米饭真好吃！）
 
 > [!TIP]
 >
-> V1.6.0版本大升级(V1.6.1修复了两个BUG，V1.6.2为质量修复版），管理页换新，功能已尽可能完善，建议升级（后续更新会放缓，作者的大部分想法已实现，当然还有一些以后再说）（wrangler.toml 的配置项比较多，建议使用 wrangler.toml 配置生成器）
+> V1.7.0版本缝缝补补（官方客户端 2.6.4/2.7.0/2.7.1 三版本实测通过；修复大路由表与多跳组网、新增额度触顶优雅降级与限流违规自动拉黑），视自己情况更新（后续更新会放缓，作者的大部分想法已实现，当然还有一些以后再说）（wrangler.toml 的配置项比较多，建议使用 wrangler.toml 配置生成器）
 
 
 ---

@@ -16,7 +16,7 @@
  */
 import Long from 'long';
 import {
-  PEER_CENTER_TTL_MS, SESSION_TTL_MS,
+  PEER_CENTER_TTL_MS, PEER_CENTER_MAX_ENTRIES, SESSION_TTL_MS,
   ROUTE_INFO_TTL_MS, ROUTE_INFO_UNREACHABLE_MS,
   MAX_ROUTES_PER_GROUP, MAX_ROUTE_INFO_BYTES,
 } from './constants.js';
@@ -657,6 +657,14 @@ export class PeerManager {
       directPeers: (peerInfo && peerInfo.directPeers) || {},
       lastSeen: Date.now(),
     });
+    // v1.7 复核修复：条目总数上限——超出按 lastSeen 最旧淘汰（B10 后会话态
+    // 路径可从任意非直连身份持续建条目，此裁剪兜底内存放大面）
+    if (pc.globalPeerMap.size > PEER_CENTER_MAX_ENTRIES) {
+      const entries = [...pc.globalPeerMap.entries()]
+        .sort((a, b) => (a[1].lastSeen || 0) - (b[1].lastSeen || 0));
+      const drop = entries.length - PEER_CENTER_MAX_ENTRIES;
+      for (let i = 0; i < drop; i++) pc.globalPeerMap.delete(entries[i][0]);
+    }
     pc.digest = '0'; // 失效缓存
     pc.dirty = true; // 脏标：下次 GetGlobalPeerMap 重建快照与摘要
     // 审计：仅记录新增/移除，周期性刷新不记录（避免刷屏）

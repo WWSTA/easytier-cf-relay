@@ -1,13 +1,14 @@
 {
   "name": "easytier-cf-relay",
-  "version": "1.6.2",
+  "version": "1.7.0",
   "description": "EasyTier WebSocket relay on Cloudflare Workers + Durable Objects (pure P2P preferred, hibernation-friendly)",
   "main": "src/index.js",
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy --env=\"\"",
-    "dry-run": "wrangler deploy --dry-run --env=\"\" --outdir dist-check"
+    "dry-run": "wrangler deploy --dry-run --env=\"\" --outdir dist-check",
+    "ci": "node tools/run_ci.mjs"
   },
   "dependencies": {
     "long": "^5.2.4",

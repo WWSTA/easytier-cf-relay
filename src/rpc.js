@@ -15,7 +15,7 @@
  * - SyncRouteInfoRequest 出站走 wire 层重组（wire.js），逐字节保留对端上报的
  *   RoutePeerInfo 原始内容（对齐官方 route_peer_wire.rs raw_peer_infos 机制）。
  */
-import { PacketType, CompressionAlgo, RpcProtoName, MAX_SYNC_ITEMS, MAX_DIRECT_PEERS_REPORT, MAX_ROUTE_INFO_BYTES, FULL_RESYNC_COOLDOWN_MS, WS_CLOSE } from './constants.js';
+import { PacketType, CompressionAlgo, RpcProtoName, MAX_SYNC_ITEMS, MAX_DIRECT_PEERS_REPORT, MAX_ROUTE_INFO_BYTES, FULL_RESYNC_COOLDOWN_MS, WS_CLOSE, RPC_MERGER_TTL_MS, RPC_MERGER_MAX_ENTRIES, RPC_MERGER_MAX_PIECES, RPC_MERGER_MAX_TOTAL_BYTES } from './constants.js';
 import {
   protoTypes, toU64Long, randomU64Long, longToString,
 } from './proto.js';
@@ -150,6 +150,123 @@ export function encodeRoutePush(push) {
 // ---------------------------------------------------------------------------
 
 /**
+ * RPC 分片重组（v1.7 B9，官方 PacketMerger 语义对齐 rpc/packet.rs:57-150）。
+ *
+ * 官方客户端对编码后 >1260 字节（RPC_PACKET_UDP_PAYLOAD_BUDGET=1300 − 40 开销）的
+ * RPC 自动切片，每片都是完整 RpcPacket（未压缩时所有片带 descriptor，compression_info
+ * 仅首片）。本端此前无重组逻辑——大路由表网络的 SyncRouteInfo 逐片解码全部失败
+ * （生产 2026-11-21 实锤 SyncRouteInfo decode failed ×9，FAQ Q2 的一类未解释成因）。
+ *
+ * 校验与防护（官方同款 + 本端加码）：
+ * - total_pieces > RPC_MERGER_MAX_PIECES(1024) 或 ==0 → 拒绝（官方为 32*1024，
+ *   本端按字节预算收紧，见 constants.js 注释）；
+ * - piece_idx >= total_pieces → 拒绝；首片缺 descriptor → 拒绝（官方 :110-114）；
+ * - total_pieces==0 && piece_idx==0 → 原样放行（官方 legacy 直通 :106-108）；
+ * - 片按索引存放：乱序可收、重复覆盖（官方 :138-140 同款，filled 计数防双计）；
+ *   存片时拷贝 body（v1.7 复核修复：protobufjs body 是整帧 subarray，直接持有会
+ *   让 1 字节片保留 128KB 帧缓冲——远程内存放大面）；
+ * - 事务累计字节 ≤ MAX_MESSAGE_BYTES + 全局累计 ≤ RPC_MERGER_MAX_TOTAL_BYTES
+ *   （v1.7 复核修复：跨事务总量兜底，超出按 lastAt 最旧淘汰）；
+ * - 并发事务上限 + 10s TTL 淘汰（官方 server.rs:200-207 同款；room alarm 另有周期扫描；
+ *   淘汰仅在插入新事务时执行且不淘汰当前键——续片不会误伤自身）。
+ *
+ * 出站不切片：官方接收方对 total_pieces=1 的大包零尺寸上限（server.rs/client.rs
+ * 解码前无长度检查，仅传输层 UDP 数据报 ≤65535），本端出站维持单包即可。
+ *
+ * @returns {object|null|false} null=片已收下等后续片；false=校验拒绝；object=合并后的
+ *   单包（或原样直通的 total_pieces==1 / legacy 包）
+ */
+export function mergeRpcPieces(ctx, header, p) {
+  const total = Number(p.totalPieces) || 0;
+  const idx = Number(p.pieceIdx) || 0;
+  if (total === 0 && idx === 0) return p; // 官方 legacy 直通（packet.rs:106-108）
+  if (total === 0 || total > RPC_MERGER_MAX_PIECES || idx >= total ||
+      (idx === 0 && !p.descriptor)) {
+    if (ctx.counters) ctx.counters.rpcPieceDropped += 1;
+    ctx.log.warn(
+      `rpc piece rejected from=${header.fromPeerId} total=${total} idx=${idx}` +
+      `${idx === 0 && !p.descriptor ? ' (first piece missing descriptor)' : ''}`
+    );
+    return false;
+  }
+  if (total === 1) return p; // 单片直通（body 尺寸已由上层 4009 约束）
+
+  const txn = longToString(p.transactionId);
+  const key = header.fromPeerId + ':' + txn;
+  const now = Date.now();
+  const m = ctx.rpcMerger || (ctx.rpcMerger = new Map());
+  // TTL 淘汰（官方 server 10s 同款），计入拒绝
+  for (const [k, e] of m) {
+    if (now - e.lastAt > RPC_MERGER_TTL_MS) {
+      m.delete(k);
+      if (ctx.counters) ctx.counters.rpcPieceDropped += 1;
+    }
+  }
+  let e = m.get(key);
+  // 事务延续校验（官方 packet.rs:129-136）：txn/total 与在途事务不符即重置
+  if (!e || e.txn !== txn || e.total !== total) {
+    // v1.7 复核修复：容量淘汰仅在新插入时执行（续片不触发、不误淘汰自身）
+    while (m.size >= RPC_MERGER_MAX_ENTRIES) {
+      let oldest = null;
+      for (const [k, v] of m) if (!oldest || v.lastAt < oldest[1].lastAt) oldest = [k, v];
+      m.delete(oldest[0]);
+      if (ctx.counters) ctx.counters.rpcPieceDropped += 1;
+    }
+    e = { txn, total, pieces: new Array(total).fill(null), filled: 0, bytes: 0, lastAt: now };
+    m.set(key, e);
+  }
+  e.lastAt = now;
+  const body = p.body || new Uint8Array(0);
+  // 事务累计字节 ≤ MAX_MESSAGE_BYTES（本端加码）：重复片按净变化计（覆盖扣旧值）
+  const prev = e.pieces[idx];
+  const prevLen = prev && prev.body ? prev.body.length : 0;
+  // MAX_MESSAGE_BYTES 为 buildConfig 配置项（env 可调，缺省 131072），非常量导出
+  if (e.bytes - prevLen + body.length > (ctx.config.maxMessageBytes || 131072)) {
+    m.delete(key);
+    if (ctx.counters) ctx.counters.rpcPieceDropped += 1;
+    ctx.log.warn(`rpc piece stream over byte budget from=${header.fromPeerId} txn=${txn}, dropped`);
+    return false;
+  }
+  // v1.7 复核修复：全局内存预算——跨全部在途事务 body 字节累计上限，超出按
+  // lastAt 最旧淘汰（不计当前键），防「1024 事务 × 128KB」的聚合放大
+  let totalBytes = 0;
+  for (const v of m.values()) totalBytes += v.bytes;
+  while (totalBytes - prevLen + body.length > RPC_MERGER_MAX_TOTAL_BYTES && m.size > 0) {
+    let oldest = null;
+    for (const [k, v] of m) if (k !== key && (!oldest || v.lastAt < oldest[1].lastAt)) oldest = [k, v];
+    if (!oldest) break; // 仅剩当前事务（单事务已受 MAX_MESSAGE_BYTES 约束）
+    totalBytes -= oldest[1].bytes;
+    m.delete(oldest[0]);
+    if (ctx.counters) ctx.counters.rpcPieceDropped += 1;
+  }
+  e.bytes = e.bytes - prevLen + body.length;
+  if (!prev) e.filled += 1;
+  // v1.7 复核修复：body 拷贝存片（原帧缓冲随解码结果释放，不随片长期持有）
+  p.body = body.slice();
+  e.pieces[idx] = p;
+  if (e.filled < total) return null; // 等后续片
+
+  // 收齐：按索引拼接 body（纯字节，无片间帧头）+ 模板取首片重置（官方 :78-100 同款）
+  let mergedLen = 0;
+  for (const piece of e.pieces) mergedLen += piece.body ? piece.body.length : 0;
+  const out = new Uint8Array(mergedLen);
+  let off = 0;
+  for (const piece of e.pieces) {
+    if (piece.body && piece.body.length) { out.set(piece.body, off); off += piece.body.length; }
+  }
+  const merged = e.pieces[0];
+  merged.body = out;
+  merged.totalPieces = 1;
+  merged.pieceIdx = 0;
+  m.delete(key);
+  if (ctx.counters) ctx.counters.rpcPieceMerged += 1;
+  ctx.log.debug(
+    `rpc pieces merged from=${header.fromPeerId} txn=${txn} pieces=${total} bodyLen=${mergedLen}`
+  );
+  return merged;
+}
+
+/**
  * 处理发往本端的 RpcReq。
  * @param {object} ctx { pm, config, log, send(ws, bytes), pushRoute(ws, forceFull), broadcast(groupKey, excludePeerId) }
  * @returns {boolean} 是否被识别处理
@@ -163,6 +280,12 @@ export async function handleRpcRequest(ctx, ws, header, payload) {
     ctx.log.warn(`rpc decode failed from=${header.fromPeerId}: ${e.message}`);
     return false;
   }
+
+  // v1.7 B9：RPC 分片重组——null=片已收下等后续片；false=校验拒绝
+  const mergedReq = mergeRpcPieces(ctx, header, rpcPacket);
+  if (mergedReq === null) return true;
+  if (mergedReq === false) return false;
+  rpcPacket = mergedReq;
 
   if (rpcPacket.compressionInfo && Number(rpcPacket.compressionInfo.algo) > CompressionAlgo.None) {
     ctx.log.warn(
@@ -237,8 +360,11 @@ async function handleSyncRouteInfo(ctx, ws, header, rpcPacket, innerBody) {
 
   const pm = ctx.pm;
 
-  // 会话角色（官方：响应方 is_initiator = !请求方 is_initiator）
-  if (typeof req.isInitiator === 'boolean') {
+  // 会话角色（官方：响应方 is_initiator = !请求方 is_initiator）。
+  // v1.7 复核修复：仅连接自身身份的上报才更新——B10 后 fromPeerId 可为经他人
+  // 连接转发的子节点身份，此时的 isInitiator 属于子节点会话，不能翻转父连接的
+  // 连接级角色（否则父连接 OSPF 角色抖动/额外重同步）
+  if (typeof req.isInitiator === 'boolean' && fromPeerId === ws._peerId) {
     ws._weAreInitiator = !req.isInitiator;
   }
   // 对端会话 id 更新走统一入口（与 RpcResp 路径同一处重置）：客户端不断线重开会话时，
@@ -275,10 +401,14 @@ async function handleSyncRouteInfo(ctx, ws, header, rpcPacket, innerBody) {
   for (let i = 0; i < items.length; i++) {
     const info = items[i];
     if (typeof info.peerId === 'number') {
-      const source = info.peerId === fromPeerId ? 'direct' : 'transit';
+      // v1.7 复核修复：direct 判据=「连接自身身份自报」（v1.7 B10 后 fromPeerId 可为
+      // 经他人连接转发的子节点身份——父替子自报不得标 direct，否则绕过幽灵清理
+      // 且阻断 transit 纠正）。reporterPid 同为连接身份：父连接断开时其转发的
+      // 子节点 transit 条目随幽灵防线一并清除（与 pre-B10 行为一致）
+      const source = info.peerId === ws._peerId ? 'direct' : 'transit';
       // 幽灵防线：reporterPid 让 PeerManager 追踪 transit 条目来源，
       // 上报者断开后其上报的无主条目立即清除
-      const r = pm.updatePeerInfo(groupKey, info, rawItems ? rawItems[i] : null, source, fromPeerId,
+      const r = pm.updatePeerInfo(groupKey, info, rawItems ? rawItems[i] : null, source, ws._peerId,
         { deferBump: true, deferEmit: true });
       if (r.isNew) {
         hasNew = true;
@@ -476,6 +606,10 @@ export function handleRpcResponse(ctx, ws, header, payload) {
   } catch {
     return;
   }
+  // v1.7 B9：RPC 分片重组（与请求路径同一语义；null=等后续片 / false=拒绝）
+  const mergedResp = mergeRpcPieces(ctx, header, rpcPacket);
+  if (mergedResp === null || mergedResp === false) return;
+  rpcPacket = mergedResp;
   const service = serviceNameOf(rpcPacket.descriptor);
   if (service !== 'OspfRouteRpc') return;
 

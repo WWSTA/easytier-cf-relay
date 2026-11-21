@@ -59,6 +59,25 @@ export function statsToPrometheus(stats) {
   counter('easytier_squat_suspect_total', c.squatSuspect);
   // 落盘降级（v1.6.2 补齐）：持续增长说明路由状态体积异常（超 DO storage 单值预算）
   counter('easytier_flush_degraded_total', c.flushDegraded);
+  // KV 写失败（v1.7 D5）：KV 配额/网络异常时增长；失败键保持脏标记下轮重试
+  counter('easytier_kv_write_failed_total', c.kvWriteFailed);
+  // KV 写预算跳过（v1.7 A4）：日预算 900 耗尽按牺牲序跳低优 rec 键，次日 UTC 复位
+  counter('easytier_kv_write_budget_skipped_total', c.kvWriteBudgetSkipped);
+  // 今日 kill 计数（v1.7 D5，DO 口径：4008 断开 + DO 层黑名单拒绝；UTC 日重置 =
+  // Prometheus counter reset，rate() 原生处理）
+  counter('easytier_kills_today_total', c.killsToday);
+  // 黑名单降级态（v1.7 C5）：1 = KV 冷启动恢复失败（边缘防线退化，DO 权威兜底）
+  gauge('easytier_blacklist_degraded', s.blDegraded ? 1 : 0);
+  // 额度 shed 激活态（v1.7 A5）：1 = 当日用量触顶，新连接被 429 拒绝（存量会话不受影响）
+  gauge('easytier_shed_active', s.shed ? 1 : 0);
+  // RPC 分片重组（v1.7 B9）：官方客户端大 RPC 自动切片，本端收齐重组
+  counter('easytier_rpc_piece_merged_total', c.rpcPieceMerged);
+  // 分片校验拒绝（v1.7 B9）：total_pieces 越界/缺首片 descriptor/字节预算超限/超限淘汰
+  counter('easytier_rpc_piece_dropped_total', c.rpcPieceDropped);
+  // 限流违规自动临时拉黑（v1.7 C4）：观察窗触发 blacklistAdd socket 类的次数
+  counter('easytier_auto_blacklisted_total', c.autoBlacklisted);
+  // 转发放行（v1.7 B10）：官方多跳转发语义（from=非直连身份，父节点替子转发）
+  counter('easytier_forwarded_from_total', c.forwardedFrom);
 
   return lines.join('\n') + '\n';
 }

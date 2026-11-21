@@ -16,7 +16,7 @@ SERVER_PEER_ID = "10000001"
 # 服务端在握手响应中宣告的网络名（与客户端网络名不同 => 外部网络中继模式）
 SERVER_NETWORK_NAME = "public_server"
 SERVER_HOSTNAME = "easytier-cf-relay"
-SERVER_VERSION_STR = "easytier-cf-relay/1.6.2"
+SERVER_VERSION_STR = "easytier-cf-relay/1.7.0"
 # 指定 Durable Object 地区配置（可选值：wnam 西部地区（北美）enam 东部地区（北美）sam 南美洲 weur 西欧 eeur 东欧 apac	亚太地区（已设置，默认未开启） oc 大洋洲 afr 非洲 me 中东）
 # LOCATION_HINT = "apac"
 # 纯 P2P 模式：1 = 在 feature_flag 中宣告 avoid_relay_data（OSPF 给本节点边赋大代价，

@@ -558,6 +558,9 @@ function loadTab(keepSel) {
     if (s.tab === 'overview') OVERVIEW = s;
     if (!keepSel) SEL = {}; // 翻页/切页清空勾选；自动刷新保留用户勾选
     render(s);
+    // v1.7 复核修复：render 会重绘 #content（含额度卡横幅容器），横幅必须在
+    // 渲染完成后注入，否则被整页重绘冲掉（shed 手动清除按钮不可达）
+    if (s.tab === 'overview') updateShedBanner();
     $('status').textContent = '更新于 ' + new Date().toLocaleTimeString();
   }).catch(function (e) {
     $('status').textContent = e.message;
@@ -981,6 +984,7 @@ function renderOverview(s) {
     h += '<div class="card' + cardCls('quota') + '" id="card-quota">';
     h += '<h3 class="card-h" data-card="quota"><span>额度观测（quota）</span>' + CHEV + '</h3>';
     h += '<div class="card-b">';
+    h += '<div id="quota-shed"></div>';
     h += '<div id="quota-real">' + (QUOTA_UNCONF ? unconfHintHtml('quota') : '') + '</div>';
     h += '<div id="quota-est">';
     h += kv('今日计费请求（估算）', '≈ ' + est.toLocaleString() + ' / ' + quota.toLocaleString());
@@ -1101,6 +1105,42 @@ function renderOverview(s) {
     h += kv('落盘降级', c.flushDegraded || 0, (c.flushDegraded || 0) > 0 ? 'warn' : 'good',
       '状态写回超预算的降级重试次数（丢 raw / 裁剪条目两档），持续增长说明路由状态体积异常；' +
       '正常运行恒为 0。计数随 DO 重启归零');
+    var kvb = (s.audit && s.audit.kvBudget) || { used: 0, budget: 900 };
+    h += kv('KV 写预算', kvb.used + ' / ' + kvb.budget, kvb.used >= kvb.budget ? 'warn' : 'good',
+      '当日 KV 镜像写尝试用量 / 日预算（KV_WRITE_DAILY_BUDGET=900，免费额度 1000/天留 10% 余量）。' +
+      '耗尽后按牺牲序跳过低优先级记录键（黑名单键永不跳），次日 UTC 复位');
+    h += kv('KV 写失败', c.kvWriteFailed || 0, (c.kvWriteFailed || 0) > 0 ? 'warn' : 'good',
+      'KV 镜像写失败次数（配额 / 网络异常）。失败键保持脏标记下轮重试，' +
+      'DO storage 权威数据无损。计数随 DO 重启归零');
+    h += kv('KV 预算跳过', c.kvWriteBudgetSkipped || 0, (c.kvWriteBudgetSkipped || 0) > 0 ? 'warn' : 'good',
+      'KV 写日预算耗尽后被跳过的低优先级记录键次（牺牲序：routes → peercenter → digests）。' +
+      '黑名单键永不跳过。次日 UTC 复位');
+    h += kv('今日断开', c.killsToday || 0, (c.killsToday || 0) > 0 ? 'bad' : 'good',
+      '当日 kill 计数（DO 口径：速率限流 4008 断开 + DO 层黑名单握手拒绝）。' +
+      '边缘层 403 拒绝不经过 DO 不在此计数；UTC 日重置，DO 重启不丢当日计数（持久化）');
+    h += kv('黑名单降级', s.blDegraded ? '降级' : '正常', s.blDegraded ? 'bad' : 'good',
+      '黑名单 KV 冷启动恢复失败时进入降级态：本实例内存黑名单可能不完整，' +
+      '接入拦截退化为 DO 权威兜底；alarm 每 60s 自动重试恢复，成功即清除');
+    h += kv('额度降级（shed）', s.shed ? '激活' : '正常', s.shed ? 'bad' : 'good',
+      '当日用量触顶前的优雅降级（v1.7 A5）：激活时【新】连接被 429 拒绝' +
+      '（已建立的 Hibernation 会话不受影响，存量 mesh 跑到 UTC 复位）；' +
+      '用量回落自动恢复，额度卡可手动清除。平台 Error 1027 全瘫的前置防线');
+    h += kv('分片重组完成', c.rpcPieceMerged || 0, 'good',
+      '官方客户端对编码后 >1260 字节的大 RPC（如大路由表的 SyncRouteInfo）自动切片，' +
+      '本端按官方 PacketMerger 语义收齐重组（v1.7 B9）。' +
+      '此前无重组逻辑时这类 RPC 逐片解码全部失败（握手成功但看不到对方的一类成因）。' +
+      '计数随 DO 重启归零');
+    h += kv('分片校验拒绝', c.rpcPieceDropped || 0, (c.rpcPieceDropped || 0) > 0 ? 'bad' : 'good',
+      '畸形分片流被拒次数：total_pieces 越限（>32768 或 0）/ 片索引越界 / 首片缺 descriptor / ' +
+      '事务字节超预算（128 KiB）/ 重组事务超限淘汰。非零说明有异常客户端或畸形分片流。' +
+      '计数随 DO 重启归零');
+    h += kv('自动临时拉黑', c.autoBlacklisted || 0, (c.autoBlacklisted || 0) > 0 ? 'warn' : 'good',
+      '限流违规自动拉黑次数（v1.7 C4）：单 IP 10 分钟滑动窗内 ≥5 次 4008 速率限流断开，' +
+      '自动对肇事 IP 加黑名单（reason 前缀 auto rate-limit，黑名单页可一键解除；' +
+      '解除后清观察窗重新计数）。防限流-重连循环烧额度（2026-11 事故指纹）');
+    h += kv('转发放行', c.forwardedFrom || 0, 'good',
+      '多跳转发放行次数（v1.7 B10）：包内 from 与连接身份不符、但被声称身份非直连在线' +
+      '（父节点替子节点转发，官方多跳语义保持原始 from）。确证伪造走「伪造拦截」计数');
     h += '</div></div>';
   }
   // 网络分组
@@ -1245,6 +1285,24 @@ function unconfRecheck(kind) {
   var el = $('quota-real');
   if (el) el.innerHTML = '<div class="empty">检测中…</div>';
   refreshQuotaCard(true);
+}
+/** 额度 shed 横幅（v1.7 A5）：OVERVIEW.stats.shed 驱动；手动清除后刷新状态 */
+function updateShedBanner() {
+  var el = document.getElementById('quota-shed');
+  if (!el) return;
+  var st = OVERVIEW && OVERVIEW.stats;
+  if (!(st && st.shed)) { el.innerHTML = ''; return; }
+  el.innerHTML = '<div class="empty"><b>额度降级（shed）已激活</b>：当日用量触顶，新连接被 429 拒绝' +
+    '（已建立的会话不受影响，UTC 0 点复位自动恢复；详见部署手册 FAQ）。' +
+    '<a href="javascript:void(0)" data-shed="clear" onclick="shedClear()">手动清除</a></div>';
+}
+function shedClear() {
+  if (!window.confirm('手动清除额度 shed？清除后新连接恢复接入；若用量仍触顶，下一轮检查（15 分钟内）会重新激活。')) return;
+  post('/api/shed/clear', {}).then(function () {
+    loadTab(); // 清除后刷新状态（横幅随 OVERVIEW.stats.shed 消失）
+  }).catch(function (e) {
+    window.alert('清除失败：' + (e && e.message ? e.message : '未知错误'));
+  });
 }
 
 /* ---------------- AE 趋势（v1.6 A5+D2，双轴 + 悬停提示，纯 SVG 零图表库）----------------
